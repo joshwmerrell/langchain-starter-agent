@@ -31,7 +31,7 @@ SYSTEM_PROMPT = """
 
 agent = create_agent(
     model="google_genai:gemini-flash-lite-latest",
-    prompt=SYSTEM_PROMPT,
+    system_prompt=SYSTEM_PROMPT,
     tools=[read_safe_file, list_directory],
     checkpointer=InMemorySaver()
 )
