@@ -6,10 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dotenv>=0.9.9",
-    "langchain>=1.4.2",
+    "langchain[mcp]>=1.4.2",
     "langchain-google-genai>=4.4.0",
     "rich>=15.0.0",
     "uuid>=1.30",
+    "langchain-mcp-adapters>=0.3.1",
+    "deepagents>=0.7.21",
 ]
 
 [project.scripts]
