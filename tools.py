@@ -2,6 +2,7 @@ import subprocess
 
 from fnmatch import fnmatch
 from pathlib import Path
+from langchain.tools import tool
 
 # Files outside this directory can never be accessed by the agent.
 SAFE_ROOT = Path(__file__).resolve().parent
@@ -33,6 +34,7 @@ def _resolve_safe(path: str) -> Path:
     return target
 
 
+@tool
 def read_safe_file(path: str) -> str:
     """Read a UTF-8 text file from the project directory.
 
@@ -46,6 +48,7 @@ def read_safe_file(path: str) -> str:
     return target.read_text(encoding="utf-8")
 
 
+@tool
 def list_directory(path: str = ".") -> str:
     """List the contents of a directory in the project. Subdirectories end with "/".
 
@@ -64,6 +67,7 @@ def list_directory(path: str = ".") -> str:
     return "\n".join(entries) or "(empty directory)"
 
 
+@tool
 def write_safe_file(path: str, content: str) -> str:
     """Create a new file or overwrite an existing file with UTF-8 text.
 
@@ -78,6 +82,7 @@ def write_safe_file(path: str, content: str) -> str:
     return f"Successfully wrote to {path}"
 
 
+@tool
 def execute_command(command: str) -> str:
     """Run a shell command in the project root directory.
 
@@ -105,6 +110,7 @@ def execute_command(command: str) -> str:
         return f"Error executing command: {e}"
 
 
+@tool
 def check_code_quality(path: str) -> str:
     """Run built-in Python syntax and formatting checks (using python -m py_compile) on a file.
 
@@ -123,3 +129,30 @@ def check_code_quality(path: str) -> str:
         return f"Code quality check failed for {path}:\n{e}"
     except Exception as e:
         return f"Error running code quality check: {e}"
+
+
+def get_git_diff() -> str:
+    """Show the git diff of the project to review current proposed code changes."""
+    try:
+        result = subprocess.run(
+            "git diff",
+            shell=True,
+            cwd=SAFE_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = f"Exit code: {result.returncode}\n"
+        if result.stdout:
+            output += f"STDOUT:\n{result.stdout}\n"
+        if result.stderr:
+            output += f"STDERR:\n{result.stderr}\n"
+        return output.strip()
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+
+# Decorate get_git_diff as a LangChain tool after defining the base function
+get_git_diff = tool(get_git_diff)

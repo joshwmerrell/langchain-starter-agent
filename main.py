@@ -6,13 +6,21 @@ from langchain.agents import create_agent
 from langchain_core.exceptions import ModelRateLimitError
 from langchain.rate_limiters import InMemoryRateLimiter
 from langchain.mcp import MCPAdapter
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
 
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
 
-from tools import list_directory, read_safe_file, write_safe_file, execute_command, check_code_quality
+from tools import (
+    list_directory,
+    read_safe_file,
+    write_safe_file,
+    execute_command,
+    check_code_quality,
+    get_git_diff,
+)
 
 load_dotenv()
 
@@ -38,7 +46,8 @@ SYSTEM_PROMPT = """
     You can inspect this project with the list_directory and read_safe_file tools.
     Their paths are relative to the project root, and access is read-only.
     You can inspect, write, and edit project files using `list_directory`, `read_safe_file`, and `write_safe_file`.                           
-    You can also run tests and shell commands using `execute_command` and check code quality using `check_code_quality`.                                                                        
+    You can also run tests and shell commands using `execute_command` and check code quality using `check_code_quality`.
+    You can also check proposed changes with `get_git_diff`.                                                                        
     All file and command operations are restricted to the project root directory.
 
     Your personality is as follows:
@@ -52,7 +61,14 @@ MCP_URL = "https://docs.langchain.com/mcp"
 
 
 async def run_agent() -> None:
-    tools = [list_directory, read_safe_file, write_safe_file, execute_command, check_code_quality]
+    tools = [
+        list_directory,
+        read_safe_file,
+        write_safe_file,
+        execute_command,
+        check_code_quality,
+        get_git_diff,
+    ]
     with console.status("Connecting to LangChain documentation tools..."):
         try:
             async with MCPAdapter(MCP_URL) as adapter:
@@ -70,12 +86,15 @@ async def run_agent() -> None:
         max_bucket_size=5,  # Controls maximum burst size
     )
 
+    model = ChatGoogleGenerativeAI(
+        model="gemini-flash-lite-latest",
+        rate_limiter=rate_limiter,
+    )
     agent = create_agent(
-        model="google_genai:gemini-flash-lite-latest",
+        model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=tools,
         checkpointer=InMemorySaver(),
-        rate_limiter=rate_limiter,
     )
     thread_config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     while True:
