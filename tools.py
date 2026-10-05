@@ -64,41 +64,62 @@ def list_directory(path: str = ".") -> str:
     return "\n".join(entries) or "(empty directory)"
 
 
-def write_safe_file(path: str, content: str) -> str:                                                                                          
-     """Create a new file or overwrite an existing file with UTF-8 text.                                                                       
-                                                                                                                                               
-     Args:                                                                                                                                     
-         path: File path relative to the project root.                                                                                         
-         content: The text content to write.                                                                                                   
-     """                                                                                                                                       
-     target = _resolve_safe(path)                                                                                                              
-     # Ensure parent directories exist if writing to a nested path                                                                             
-     target.parent.mkdir(parents=True, exist_ok=True)                                                                                          
-     target.write_text(content, encoding="utf-8")                                                                                              
-     return f"Successfully wrote to {path}"
+def write_safe_file(path: str, content: str) -> str:
+    """Create a new file or overwrite an existing file with UTF-8 text.
 
-def execute_command(command: str) -> str:                                                                                                     
-     """Run a shell command in the project root directory.                                                                                     
-                                                                                                                                               
-     Args:                                                                                                                                     
-         command: The shell command to execute (e.g., "pytest", "python main.py").                                                             
-     """                                                                                                                                       
-     try:                                                                                                                                      
-         result = subprocess.run(                                                                                                              
-             command,                                                                                                                          
-             shell=True,                                                                                                                       
-             cwd=SAFE_ROOT,                                                                                                                    
-             capture_output=True,                                                                                                              
-             text=True,                                                                                                                        
-             timeout=30,                                                                                                                       
-         )                                                                                                                                     
-         output = f"Exit code: {result.returncode}\n"                                                                                          
-         if result.stdout:                                                                                                                     
-             output += f"STDOUT:\n{result.stdout}\n"                                                                                           
-         if result.stderr:                                                                                                                     
-             output += f"STDERR:\n{result.stderr}\n"                                                                                           
-         return output.strip()                                                                                                                 
-     except subprocess.TimeoutExpired:                                                                                                         
-         return "Error: Command timed out after 30 seconds."                                                                                   
-     except Exception as e:                                                                                                                    
-         return f"Error executing command: {e}"
+    Args:
+        path: File path relative to the project root.
+        content: The text content to write.
+    """
+    target = _resolve_safe(path)
+    # Ensure parent directories exist if writing to a nested path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return f"Successfully wrote to {path}"
+
+
+def execute_command(command: str) -> str:
+    """Run a shell command in the project root directory.
+
+    Args:
+        command: The shell command to execute (e.g., "pytest", "python main.py").
+    """
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=SAFE_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        output = f"Exit code: {result.returncode}\n"
+        if result.stdout:
+            output += f"STDOUT:\n{result.stdout}\n"
+        if result.stderr:
+            output += f"STDERR:\n{result.stderr}\n"
+        return output.string if hasattr(result, 'string') else output.strip()
+    except subprocess.TimeoutExpired:
+        return "Error: Command timed out after 30 seconds."
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+
+def check_code_quality(path: str) -> str:
+    """Run built-in Python syntax and formatting checks (using python -m py_compile) on a file.
+
+    Args:
+        path: File path relative to the project root to check.
+    """
+    target = _resolve_safe(path)
+    if not target.is_file():
+        raise PermissionError("Access denied or file not found.")
+
+    try:
+        import py_compile
+        py_compile.compile(str(target), doraise=True)
+        return f"Code quality check passed: {path} has valid syntax."
+    except py_compile.PyCompileError as e:
+        return f"Code quality check failed for {path}:\n{e}"
+    except Exception as e:
+        return f"Error running code quality check: {e}"
