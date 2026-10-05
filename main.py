@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
 
-from tools import list_directory, read_safe_file
+from tools import list_directory, read_safe_file, write_safe_file, execute_command
 
 load_dotenv()
 
@@ -35,6 +35,9 @@ SYSTEM_PROMPT = """
     Do not make up any answer unless the user requests you to do so.
     You can inspect this project with the list_directory and read_safe_file tools.
     Their paths are relative to the project root, and access is read-only.
+    You can inspect, write, and edit project files using `list_directory`, `read_safe_file`, and `write_safe_file`.                           
+    You can also run tests and shell commands using `execute_command`.                                                                        
+    All file and command operations are restricted to the project root directory.
 
     Your personality is as follows:
     - You are concise and professional in your responses.
@@ -47,7 +50,7 @@ MCP_URL = "https://docs.langchain.com/mcp"
 
 
 async def run_agent() -> None:
-    tools = [list_directory, read_safe_file]
+    tools = [list_directory, read_safe_file, write_safe_file, execute_command]
     with console.status("Connecting to LangChain documentation tools..."):
         try:
             async with MCPAdapter(MCP_URL) as adapter:

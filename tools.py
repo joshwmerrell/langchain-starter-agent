@@ -1,3 +1,5 @@
+import subprocess
+
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -60,3 +62,43 @@ def list_directory(path: str = ".") -> str:
         if _is_allowed(entry.resolve())
     )
     return "\n".join(entries) or "(empty directory)"
+
+
+def write_safe_file(path: str, content: str) -> str:                                                                                          
+     """Create a new file or overwrite an existing file with UTF-8 text.                                                                       
+                                                                                                                                               
+     Args:                                                                                                                                     
+         path: File path relative to the project root.                                                                                         
+         content: The text content to write.                                                                                                   
+     """                                                                                                                                       
+     target = _resolve_safe(path)                                                                                                              
+     # Ensure parent directories exist if writing to a nested path                                                                             
+     target.parent.mkdir(parents=True, exist_ok=True)                                                                                          
+     target.write_text(content, encoding="utf-8")                                                                                              
+     return f"Successfully wrote to {path}"
+
+def execute_command(command: str) -> str:                                                                                                     
+     """Run a shell command in the project root directory.                                                                                     
+                                                                                                                                               
+     Args:                                                                                                                                     
+         command: The shell command to execute (e.g., "pytest", "python main.py").                                                             
+     """                                                                                                                                       
+     try:                                                                                                                                      
+         result = subprocess.run(                                                                                                              
+             command,                                                                                                                          
+             shell=True,                                                                                                                       
+             cwd=SAFE_ROOT,                                                                                                                    
+             capture_output=True,                                                                                                              
+             text=True,                                                                                                                        
+             timeout=30,                                                                                                                       
+         )                                                                                                                                     
+         output = f"Exit code: {result.returncode}\n"                                                                                          
+         if result.stdout:                                                                                                                     
+             output += f"STDOUT:\n{result.stdout}\n"                                                                                           
+         if result.stderr:                                                                                                                     
+             output += f"STDERR:\n{result.stderr}\n"                                                                                           
+         return output.strip()                                                                                                                 
+     except subprocess.TimeoutExpired:                                                                                                         
+         return "Error: Command timed out after 30 seconds."                                                                                   
+     except Exception as e:                                                                                                                    
+         return f"Error executing command: {e}"

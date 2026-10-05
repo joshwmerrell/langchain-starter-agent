@@ -2,44 +2,32 @@
 
 A command-line AI agent built with LangChain, Gemini, and LangGraph. It can
 answer questions, search the LangChain documentation through its MCP server,
-and inspect project files using a pair of read-only tools.
+inspect project files, write and edit files, and execute shell commands or tests.
 
 ## What it can do today
 
 - Answer questions with `gemini-flash-lite-latest`.
 - Search and read LangChain documentation using tools provided by
   `https://docs.langchain.com/mcp`.
-- List project directories with `list_directory` and read UTF-8 project files
-  with `read_safe_file`.
+- List project directories with `list_directory`, read UTF-8 project files
+  with `read_safe_file`, and write/edit project files with `write_safe_file`.
+- Execute shell commands and tests using `execute_command`.
 - Keep conversation state in memory for the duration of one run.
 - Continue working with its local project tools if the documentation MCP
   server is unavailable.
 
-Project file access is rooted at the directory containing `tools.py`, not the
-terminal's current directory. Paths must stay inside that project root;
-`.env` and `.env.*` files are excluded. File tools are read-only.
+Project file access and command execution are restricted to the project root directory.
 
 ## Long-term goal
 
-The goal is to develop this into a coding agent that can:
+The goal is to develop this into a fully capable coding agent that can:
 
 1. Read and understand its own source code and the rest of the project.
-2. Propose and write code changes.
+2. Propose, write, and edit code changes.
 3. Run approved commands, tests, and other code to verify changes.
 4. Explain what it changed and show a Git diff for review.
 
-The current agent is an early step towards that goal: it can inspect source
-files, but it **cannot write or delete files, execute shell commands, run
-tests, or commit changes**. Having `deepagents` installed does not enable its
-filesystem middleware; the current application uses its own read-only tools.
-The model may discuss or suggest code changes, but it cannot apply them.
-
-Compared with an IDE coding agent that can edit files and run a terminal, this
-agent is currently a documentation-aware read-only assistant. It is also not
-yet a self-modifying or autonomous agent. Adding write and execution tools
-would require explicit workspace boundaries, user approval, and a safe
-execution environment. Those capabilities should be introduced separately
-and verified before they are trusted with project changes.
+The current agent has evolved to support writing/editing files and executing shell commands/tests, bringing it much closer to a full coding agent.
 
 ## Setup
 
@@ -81,6 +69,7 @@ Type a question at the `Input:` prompt. For example:
 - `Search the LangChain docs for how to create an agent with tools.`
 - `List the files in the project root.`
 - `Read main.py and explain how the agent starts.`
+- `Write a file called test.md and then remove it.`
 
 Type `exit` or send EOF to quit. Documentation tools require a network
 connection; if the MCP server cannot be reached, the agent reports the issue
