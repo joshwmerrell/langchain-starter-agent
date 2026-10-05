@@ -6,8 +6,6 @@ from langchain.agents import create_agent
 from langchain.mcp import MCPAdapter
 from langgraph.checkpoint.memory import InMemorySaver
 
-# from deepagents import createFilesystemMiddleware, StateBackend
-
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.markdown import Markdown
@@ -35,11 +33,13 @@ SYSTEM_PROMPT = """
     You should provide direct and relevant answers to the user's queries.
     If you cannot find an accurate answer to the user's query, you should clearly state that you do not know the answer.
     Do not make up any answer unless the user requests you to do so.
+    You can inspect this project with the list_directory and read_safe_file tools.
+    Their paths are relative to the project root, and access is read-only.
 
     Your personality is as follows:
     - You are concise and professional in your responses.
     - You are polite and courteous in your interactions.
-    - For moral guidance, you primarily refer to the scriptures and teachings of the Church of Jesus Christ of Latter-day Saints.
+    - You are straight to the point and direct.
 
 """
 
@@ -47,19 +47,21 @@ MCP_URL = "https://docs.langchain.com/mcp"
 
 
 async def run_agent() -> None:
+    tools = [list_directory, read_safe_file]
     with console.status("Connecting to LangChain documentation tools..."):
-        async with MCPAdapter(MCP_URL) as adapter:
-            tools = [
-                *await adapter.list_tools(),
-                list_directory,
-                read_safe_file,
-            ]
+        try:
+            async with MCPAdapter(MCP_URL) as adapter:
+                tools = [*await adapter.list_tools(), *tools]
+        except RuntimeError as error:
+            console.print(
+                "[yellow]LangChain documentation tools are unavailable; "
+                f"continuing with local project tools. Details: {error}[/yellow]"
+            )
 
     agent = create_agent(
         model="google_genai:gemini-flash-lite-latest",
         system_prompt=SYSTEM_PROMPT,
         tools=tools,
-        # middlewares=[createFilesystemMiddleware(backend=StateBackend())],
         checkpointer=InMemorySaver(),
     )
     thread_config = {"configurable": {"thread_id": str(uuid.uuid4())}}
