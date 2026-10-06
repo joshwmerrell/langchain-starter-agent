@@ -1,6 +1,6 @@
-# LangChain Starter Agent
+# Coding Agent
 
-A command-line AI agent built with LangChain, Gemini, and LangGraph. It can
+A command-line coding agent built with LangChain, Gemini, and LangGraph. It can
 answer questions, search the LangChain documentation through its MCP server,
 inspect project files, write and edit files, and execute shell commands or tests.
 
@@ -23,11 +23,13 @@ Project file access and command execution are restricted to the project root dir
 The goal is to develop this into a fully capable coding agent that can:
 
 1. Read and understand its own source code and the rest of the project.
-2. Propose, write, and edit code changes.
+2. Propose, write, and edit code changes in any programming language.
 3. Run approved commands, tests, and other code to verify changes.
 4. Explain what it changed and show a Git diff for review.
+5. Communicate fluently in all spoken and programming languages.
+6. Speak and listen to the user via the device's microphone and speaker.
 
-The current agent has evolved to support writing/editing files and executing shell commands/tests, bringing it much closer to a full coding agent.
+The agent has evolved to support writing/editing files and executing shell commands/tests, functioning as a fully capable coding agent.
 
 ## Setup
 
