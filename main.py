@@ -9,7 +9,6 @@ from langchain.agents import create_agent
 from langchain_core.exceptions import ModelRateLimitError
 from langchain.rate_limiters import InMemoryRateLimiter
 from langchain.mcp import MCPAdapter
-# from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from langgraph.checkpoint.memory import InMemorySaver
 from ollama import ResponseError
@@ -47,11 +46,7 @@ logging.getLogger("langchain_google_genai._function_utils").addFilter(
 )
 
 
-# def _assistant_response_text(messages: Sequence[BaseMessage]) -> str | None:
-#     if not messages or not isinstance(messages[-1], AIMessage):
-#         return None
-#     return messages[-1].text.strip() or None
-# The following code is a fix suggested by Google Gemini.
+# The following function extracts the assistant's text response from a sequence of messages, prioritizing AI-generated text and falling back to tool outputs if necessary.
 def _assistant_response_text(messages: Sequence[BaseMessage]) -> str | None:
     current_turn_messages = []
     
@@ -120,7 +115,7 @@ Available project tools:
 
 MCP_URL = "https://docs.langchain.com/mcp"
 
-
+# The following code sets up the agent with the specified model, tools, and rate limiting, and provides a TUI for user interaction. It handles user input, invokes the agent asynchronously, and displays the agent's responses in a rich text format.
 async def setup_agent():
     tools = [
         list_directory,
@@ -172,67 +167,6 @@ async def setup_agent():
 
 async def run_agent() -> None:
     agent, thread_config = await setup_agent()
-    while True:
-        print("\n-------- User ---------")
-        try:
-            prompt = input("Input: ")
-            if prompt == "exit":
-                break
-            if not prompt.strip():
-                continue
-
-            try:
-                with console.status("Thinking..."):
-                    result = await agent.ainvoke(
-                        {"messages": [{"role": "user", "content": prompt}]},
-                        thread_config,
-                    )
-            except ModelRateLimitError as error:
-                console.print(
-                    "[yellow]The model service's rate or token quota has been reached. "
-                    "Wait for the quota window to reset, then try again. "
-                    "If this keeps happening, check the model provider's usage and "
-                    f"billing details. Details: {error}[/yellow]"
-                )
-                continue
-            except (httpx.HTTPError, ResponseError) as error:
-                console.print(
-                    "[yellow]The local Ollama request failed. Check that Ollama is "
-                    "running and the configured model is available, then try again. "
-                    f"Details: {error}[/yellow]"
-                )
-                continue
-            response = _assistant_response_text(result["messages"])
-            if response is None:
-                console.print(
-                    "[yellow]The agent finished without a text response. "
-                    "Please try again.[/yellow]"
-                )
-                continue
-        except EOFError:
-            break
-        print("\n--------- AI ----------")
-        console.print(Markdown(response))
-    # model = ChatGoogleGenerativeAI(
-    #     model="gemini-flash-lite-latest",
-    #     rate_limiter=rate_limiter
-    # )
-    model = ChatOllama(
-        model="gemma4:26b",
-        base_url="http://localhost:11434",
-        temperature=0,
-        num_ctx=16384,
-        num_predict=4096,
-        keep_alive="15m",
-        rate_limiter=rate_limiter,
-    )
-    agent = create_agent(
-        model=model,
-        system_prompt=SYSTEM_PROMPT,
-        tools=tools,
-        checkpointer=InMemorySaver(),
-    )
-    thread_config = {"configurable": {"thread_id": str(uuid.uuid4())}}
     while True:
         print("\n-------- User ---------")
         try:
