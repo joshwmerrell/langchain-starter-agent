@@ -184,7 +184,9 @@ def execute_command(command: str) -> str:
             output += f"STDOUT:\n{result.stdout}\n"
         if result.stderr:
             output += f"STDERR:\n{result.stderr}\n"
-        return output.string if hasattr(result, 'string') else output.strip()
+        # return output.string if hasattr(result, 'string') else output.strip()
+        # The following line is a fix by Google Gemini's suggestion.
+        return output.strip()
     except subprocess.TimeoutExpired:
         return "Error: Command timed out after 30 seconds."
     except Exception as e:
@@ -192,24 +194,29 @@ def execute_command(command: str) -> str:
 
 
 @tool
-def check_code_quality(path: str) -> str:
-    """Run built-in Python syntax and formatting checks (using python -m py_compile) on a file.
+def run_tests(test_path: str = ".") -> str:
+    """Run tests using pytest in the project root directory.
 
     Args:
-        path: File path relative to the project root to check.
+        test_path: The directory or file to run tests on. Defaults to the project root.
     """
-    target = _resolve_safe(path)
-    if not target.is_file():
-        raise PermissionError("Access denied or file not found.")
-
     try:
-        import py_compile
-        py_compile.compile(str(target), doraise=True)
-        return f"Code quality check passed: {path} has valid syntax."
-    except py_compile.PyCompileError as e:
-        return f"Code quality check failed for {path}:\n{e}"
+        result = subprocess.run(
+            ["pytest", test_path],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = f"Exit code: {result.returncode}\n"
+        if result.stdout:
+            output += f"STDOUT:\n{result.stdout}\n"
+        if result.stderr:
+            output += f"STDERR:\n{result.stderr}\n"
+        return output.strip()
+    except subprocess.TimeoutExpired:
+        return "Error: Tests timed out after 60 seconds."
     except Exception as e:
-        return f"Error running code quality check: {e}"
+        return f"Error running tests: {e}"
 
 
 def get_git_diff() -> str:
@@ -304,6 +311,32 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         return f"Error: old_text found {count} times; it must appear exactly once. Include more surrounding lines."
     target.write_text(text.replace(old_text, new_text), encoding="utf-8")
     return f"Edited {path}"
+
+
+@tool
+def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
+    """Replace a range of lines in a file.
+
+    Args:
+        path: File path relative to the project root.
+        start_line: The first line to replace (1-based).
+        end_line: The last line to replace (1-based).
+        new_content: The new content to insert.
+    """
+    target = _resolve_safe(path)
+    if not target.is_file():
+        raise PermissionError("Access denied or file not found.")
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+
+    if start_line < 1 or end_line > len(lines) or start_line > end_line:
+        return f"Error: Invalid line range {start_line}-{end_line}. File has {len(lines)} lines."
+
+    # Replace the lines
+    # lines is 0-indexed, so start_line 1 is index 0
+    new_lines = lines[:start_line - 1] + new_content.splitlines() + lines[end_line:]
+    target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return f"Successfully replaced lines {start_line}-{end_line} in {path}"
 
 
 # Decorate get_git_diff as a LangChain tool after defining the base function

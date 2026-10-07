@@ -29,6 +29,7 @@ The goal is to develop this into a fully capable coding agent that can:
 4. Explain what it changed and show a Git diff for review.
 5. Communicate fluently in all spoken and programming languages.
 6. Speak and listen to the user via the device's microphone and speaker.
+7. Have a user interface.
 
 The agent has evolved to support writing/editing files and executing shell commands/tests, functioning as a fully capable coding agent.
 
@@ -65,6 +66,12 @@ You can also run it from the project root without installing the command:
 
 ```powershell
 uv run main.py
+```
+
+To use the Terminal User Interface (TUI), run:
+
+```powershell
+uv run tui_agent.py
 ```
 
 Type a question at the `Input:` prompt. For example:
