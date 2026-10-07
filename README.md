@@ -1,12 +1,12 @@
 # Coding Agent
 
-A command-line coding agent built with LangChain, Gemini, and LangGraph. It can
+A command-line coding agent built with LangChain, Ollama, and LangGraph. It can
 answer questions, search the LangChain documentation through its MCP server,
 inspect project files, write and edit files, and execute shell commands or tests.
 
 ## What it can do today
 
-- Answer questions with `gemini-flash-lite-latest`.
+- Answer questions with a local Ollama model (replace the placeholder model in configuration as needed).
 - Search and read LangChain documentation using tools provided by
   `https://docs.langchain.com/mcp`.
 - List project directories with `list_directory`, read UTF-8 project files
@@ -16,7 +16,8 @@ inspect project files, write and edit files, and execute shell commands or tests
 - Continue working with its local project tools if the documentation MCP
   server is unavailable.
 
-Project file access and command execution are restricted to the project root directory.
+Project file tools are restricted to the project root directory. Commands run
+from the project root using the permissions of the local agent process.
 
 ## Long-term goal
 
@@ -34,14 +35,14 @@ The agent has evolved to support writing/editing files and executing shell comma
 ## Setup
 
 1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-2. Create a `.env` file in the project root containing your Gemini API key:
+2. Install [Ollama](https://ollama.com/download) and download a model for your setup:
 
-   ```dotenv
-   GOOGLE_API_KEY=your-key-here
+   ```powershell
+   ollama pull <your-model-name>
    ```
 
-   Keep the key private. The project file tools intentionally deny access to
-   `.env` files.
+   Make sure the Ollama server is running at `http://localhost:11434`, and update
+   the model name in the project configuration to match the model you chose.
 
 3. From the project root, install the editable command:
 
@@ -79,7 +80,10 @@ and continues with the local project-reading tools.
 
 The CLI displays a status while it connects to documentation tools and while
 it waits for a response. Conversation memory is in-process and is lost when
-the program exits.
+the program exits. The agent uses its tools to inspect or modify project files;
+the model itself does not have direct access to the filesystem. Empty model
+responses and Ollama request failures are reported, and the CLI remains ready
+for another prompt.
 
 ## Updating dependencies
 
