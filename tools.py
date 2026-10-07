@@ -1,3 +1,4 @@
+import ast
 import subprocess
 import platform
 import shutil
@@ -243,100 +244,74 @@ def get_git_diff() -> str:
 
 
 @tool
-def search_files(pattern: str, path: str = ".") -> str:
-    """Search project files for a regex pattern. Returns file:line: match (max 50).
+def get_code_symbols(path: str) -> str:
+    """Extract all class and function definitions from a Python file.
 
     Args:
-        pattern: Regex or plain text to find.
-        path: Directory relative to the project root.
+        path: File path relative to the project root.
     """
-    root = _resolve_safe(path)
+    target = _resolve_safe(path)
+    if not target.is_file() or target.suffix != ".py":
+        return f"Error: '{path}' is not a valid Python file."
+
     try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return f"Invalid regex: {e}"
-    results = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for name in filenames:
-            f = Path(dirpath, name)
-            if not _is_allowed(f.resolve()):
-                continue
-            try:
-                lines = f.read_text(encoding="utf-8").splitlines()
-            except (UnicodeDecodeError, OSError):
-                continue
-            for i, line in enumerate(lines, 1):
-                if rx.search(line):
-                    results.append(f"{f.relative_to(SAFE_ROOT)}:{i}: {line.strip()[:200]}")
-                    if len(results) >= 50:
-                        return "\n".join(results) + "\n...[truncated]"
-    return "\n".join(results) or "No matches."
+        with open(target, "r", encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+
+        symbols = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                symbols.append(f"Class: {node.name}")
+            elif isinstance(node, ast.FunctionDef):
+                # Check if it's a method inside a class
+                parent = None
+                for p in ast.walk(tree):
+                    if isinstance(p, ast.ClassDef) and node in p.body:
+                        parent = p.name
+                        break
+                prefix = f"{parent}." if parent else ""
+                symbols.append(f"Function: {prefix}{node.name}")
+
+        if not symbols:
+            return "No classes or functions found."
+
+        return "\n".join(sorted(set(symbols)))
+    except Exception as e:
+        return f"Error parsing file: {e}"
 
 
 @tool
-def read_file_lines(path: str, start: int = 1, end: int = 200) -> str:
-    """Read a line range of a file, with line numbers. Use for large files.
+def get_project_tree(path: str = ".") -> str:
+    """Return a visual tree structure of the project directory.
 
     Args:
-        path: File path relative to the project root.
-        start: First line (1-based).
-        end: Last line (max 400 lines per call).
+        path: Directory path relative to the project root. Defaults to the root.
     """
     target = _resolve_safe(path)
-    if not target.is_file():
-        raise PermissionError("Access denied or file not found.")
-    lines = target.read_text(encoding="utf-8").splitlines()
-    end = min(end, start + 399)
-    chunk = lines[max(start, 1) - 1:end]
-    return "\n".join(f"{i}: {l}" for i, l in enumerate(chunk, max(start, 1))) or "(no lines in range)"
+    if not target.is_dir():
+        return f"Error: '{path}' is not a directory."
 
+    def _build_tree(current_dir: Path, prefix: str = "") -> list[str]:
+        lines = []
+        # Get sorted entries, excluding skip dirs
+        entries = sorted(
+            [e for e in current_dir.iterdir() if _is_allowed(e.resolve()) and e.name not in SKIP_DIRS],
+            key=lambda e: (e.is_file(), e.name.lower())
+        )
+        
+        for i, entry in enumerate(entries):
+            is_last = (i == len(entries) - 1)
+            connector = "└── " if is_last else "├── "
+            
+            if entry.is_dir():
+                lines.append(f"{prefix}{connector}{entry.name}/")
+                lines.extend(_build_tree(entry, prefix + ("    " if is_last else "│   ")))
+            else:
+                lines.append(f"{prefix}{connector}{entry.name}")
+        return lines
 
-@tool
-def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replace one exact piece of text in an existing file. Prefer this over
-    write_safe_file when changing part of a file.
-
-    Args:
-        path: File path relative to the project root.
-        old_text: Exact existing text to replace. Must appear exactly once.
-        new_text: The replacement text.
-    """
-    target = _resolve_safe(path)
-    if not target.is_file():
-        raise PermissionError("Access denied or file not found.")
-    text = target.read_text(encoding="utf-8")
-    count = text.count(old_text)
-    if count != 1:
-        return f"Error: old_text found {count} times; it must appear exactly once. Include more surrounding lines."
-    target.write_text(text.replace(old_text, new_text), encoding="utf-8")
-    return f"Edited {path}"
-
-
-@tool
-def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
-    """Replace a range of lines in a file.
-
-    Args:
-        path: File path relative to the project root.
-        start_line: The first line to replace (1-based).
-        end_line: The last line to replace (1-based).
-        new_content: The new content to insert.
-    """
-    target = _resolve_safe(path)
-    if not target.is_file():
-        raise PermissionError("Access denied or file not found.")
-
-    lines = target.read_text(encoding="utf-8").splitlines()
-
-    if start_line < 1 or end_line > len(lines) or start_line > end_line:
-        return f"Error: Invalid line range {start_line}-{end_line}. File has {len(lines)} lines."
-
-    # Replace the lines
-    # lines is 0-indexed, so start_line 1 is index 0
-    new_lines = lines[:start_line - 1] + new_content.splitlines() + lines[end_line:]
-    target.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    return f"Successfully replaced lines {start_line}-{end_line} in {path}"
+    tree_lines = _build_tree(target)
+    return f"{target.relative_to(SAFE_ROOT)}/\n" + "\n".join(tree_lines) if tree_lines else f"{target.relative_to(SAFE_ROOT)}/ (empty)"
 
 
 # Decorate get_git_diff as a LangChain tool after defining the base function

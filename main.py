@@ -18,16 +18,14 @@ from rich.console import Console
 from rich.markdown import Markdown
 
 from tools import (
-    edit_file,
-    list_directory,
-    read_file_lines,
-    read_safe_file,
-    search_files,
-    write_safe_file,
-    execute_command,
+    get_code_symbols,
     get_git_diff,
+    get_project_tree,
     get_system_info,
-    replace_lines
+    list_directory,
+    read_safe_file,
+    write_safe_file,
+    execute_command
 )
 
 load_dotenv()
@@ -108,8 +106,8 @@ Available project tools:
 - `get_git_diff` shows current uncommitted changes.
 - `get_system_info` reports hardware and OS details. Pass a section:
   summary, os, cpu, memory, gpu, disk, temps, network, processes, python.
-- `search_files` searches project files for a regex pattern.
-- `read_file_lines` reads a range of lines from a file.
+- `get_code_symbols` extracts all class and function definitions from a Python file.
+- `get_project_tree` returns a visual tree structure of the project directory.
 """
 
 
@@ -124,10 +122,8 @@ async def setup_agent():
         execute_command,
         get_git_diff,
         get_system_info,
-        search_files,
-        read_file_lines,
-        edit_file,
-        replace_lines
+        get_code_symbols,
+        get_project_tree
     ]
     with console.status("Connecting to LangChain documentation tools..."):
         try:
@@ -139,12 +135,12 @@ async def setup_agent():
                 f"continuing with local project tools. Details: {error}[/yellow]"
             )
 
-    # Initialize a rate limiter to control request frequency and avoid rate limit/token spikes
-    rate_limiter = InMemoryRateLimiter(
-        requests_per_second=2.0,  # Limits requests to 2 per second
-        check_every_n_seconds=0.1,  # Check every 100ms
-        max_bucket_size=5,  # Controls maximum burst size
-    )
+    # # Initialize a rate limiter to control request frequency and avoid rate limit/token spikes
+    # rate_limiter = InMemoryRateLimiter(
+    #     requests_per_second=2.0,  # Limits requests to 2 per second
+    #     check_every_n_seconds=0.1,  # Check every 100ms
+    #     max_bucket_size=5,  # Controls maximum burst size
+    # )
 
     model = ChatOllama(
         model="gemma4:26b",
@@ -153,7 +149,7 @@ async def setup_agent():
         num_ctx=16384,
         num_predict=4096,
         keep_alive="15m",
-        rate_limiter=rate_limiter,
+        # rate_limiter=rate_limiter,
     )
     agent = create_agent(
         model=model,
