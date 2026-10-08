@@ -1,4 +1,4 @@
-"""Textual TUI front end for the coding agent.
+"""Textual TUI front end for Wallace.
 
 Run with:  python tui_agent.py
 Keys:      Enter = send, Esc = cancel current request, Ctrl+L = clear log, Ctrl+Q = quit
@@ -13,7 +13,14 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, RichLog, Static
+from textual.widgets import (
+    Button,
+    Footer,
+    Header,
+    Input,
+    RichLog,
+    Static,
+)
 
 from main import (
     assistant_response_text,
@@ -108,13 +115,23 @@ class ApprovalScreen(ModalScreen[bool]):
 
 
 class AgentTUI(App):
-    TITLE = "Coding Agent"
+    TITLE = "Wallace"
 
     CSS = """
     #chat_log {
         height: 1fr;
         border: solid green;
         margin: 1;
+    }
+    #thinking {
+        display: none;
+        height: 3;
+        margin: 0 1;
+        padding: 0 1;
+        border: round $accent;
+        background: $surface;
+        color: $text;
+        content-align: left middle;
     }
     #prompt {
         margin: 0 1 1 1;
@@ -135,14 +152,34 @@ class AgentTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         yield RichLog(id="chat_log", highlight=True, markup=True, wrap=True)
-        yield Input(placeholder="Starting agent...", id="prompt", disabled=True)
+        yield Static(id="thinking")
+        yield Input(placeholder="Starting Wallace...", id="prompt", disabled=True)
         yield Footer()
 
     def on_mount(self) -> None:
         self.chat_log = self.query_one("#chat_log", RichLog)
         self.prompt_input = self.query_one("#prompt", Input)
-        self.chat_log.write("[bold green]Agent TUI started.[/bold green]")
-        self.chat_log.write("[yellow]Initializing agent...[/yellow]")
+        self.thinking_panel = self.query_one("#thinking", Static)
+        self._thinking_messages = (
+            "Working through the details",
+            "Connecting the useful pieces",
+            "Taking a moment to get this right",
+            "Preparing a thoughtful response",
+            "Considering the next best step",
+        )
+        self._thinking_index = 0
+        self._busy = False
+        self._rotate_thinking_status = False
+        self.set_interval(2.5, self._advance_thinking_status)
+        self.chat_log.write("[bold green]Welcome to Wallace.[/bold green]")
+        self.chat_log.write(
+            "Wallace is being built to help with creative, practical, "
+            "productivity, and computing tasks, across spoken and computing "
+            "languages, with voice interaction. This TUI currently uses text; "
+            "general web, Google Workspace, and microphone/speaker access "
+            "require integrations that are not configured yet."
+        )
+        self.chat_log.write("[yellow]Initializing Wallace...[/yellow]")
         self.initialize_agent()
 
     # ---------- setup ----------
@@ -153,21 +190,41 @@ class AgentTUI(App):
             self.agent, self.thread_config = await setup_agent(on_status=self._write_warning)
         except Exception as error:
             self.chat_log.write(Text(f"Failed to start agent: {error}", style="red"))
-            self.prompt_input.placeholder = "Agent unavailable. Press Ctrl+Q to quit."
+            self.prompt_input.placeholder = "Wallace unavailable. Press Ctrl+Q to quit."
             return
 
-        self.chat_log.write("[bold green]Agent ready.[/bold green]")
+        self.chat_log.write("[bold green]Wallace is ready.[/bold green]")
         self._set_busy(False)
 
     # ---------- input handling ----------
 
     def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
         self.prompt_input.disabled = busy
         self.prompt_input.placeholder = (
-            "Working... (Esc to cancel)" if busy else "Type a message and press Enter (Ctrl+Q to quit)"
+            "Wallace is working... (Esc to cancel)"
+            if busy
+            else "Ask Wallace something (Enter to send)"
         )
+        self.thinking_panel.display = busy
+        if busy:
+            self._thinking_index = 0
+            self._set_thinking_status(rotate=True)
         if not busy:
+            self._rotate_thinking_status = False
             self.prompt_input.focus()
+
+    def _set_thinking_status(self, *, rotate: bool, message: str | None = None) -> None:
+        self._rotate_thinking_status = rotate
+        if message is None:
+            message = self._thinking_messages[self._thinking_index]
+        self.thinking_panel.update(Text(f"WALLACE  /  {message}", style="bold cyan"))
+
+    def _advance_thinking_status(self) -> None:
+        if not self._busy or not self._rotate_thinking_status:
+            return
+        self._thinking_index = (self._thinking_index + 1) % len(self._thinking_messages)
+        self._set_thinking_status(rotate=True)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
@@ -217,6 +274,10 @@ class AgentTUI(App):
                 # The agent paused for approval: ask, then resume the same run.
                 decisions = []
                 for request in requests:
+                    self._set_thinking_status(
+                        rotate=False,
+                        message="Waiting for your approval",
+                    )
                     approved = await self._ask_approval(request)
                     decisions.append(make_decision(approved))
                     self.chat_log.write(
@@ -224,6 +285,8 @@ class AgentTUI(App):
                         if approved
                         else Text("  ✗ rejected", style="red")
                     )
+                self._thinking_index = 0
+                self._set_thinking_status(rotate=True)
                 payload = resume_command(decisions)
 
             response = assistant_response_text(turn_messages)
@@ -249,9 +312,16 @@ class AgentTUI(App):
     def _show_progress(self, msg) -> None:
         """Show tool activity as it happens so a slow local model doesn't look hung."""
         for call in getattr(msg, "tool_calls", None) or []:
+            name = call.get("name", "tool")
+            self._set_thinking_status(rotate=False, message=f"Using {name}")
             self.chat_log.write(Text(f"  → {_format_tool_call(call)}", style="dim cyan"))
         if getattr(msg, "type", None) == "tool":
             name = getattr(msg, "name", None) or "tool"
+            self._thinking_index = 0
+            self._set_thinking_status(
+                rotate=True,
+                message=f"Reviewing {name} results",
+            )
             failed = getattr(msg, "status", None) == "error" or str(msg.content).startswith("Error")
             if failed:
                 self.chat_log.write(Text(f"  ✗ {name} failed", style="dim red"))

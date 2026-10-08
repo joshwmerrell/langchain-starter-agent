@@ -1,8 +1,9 @@
-# Coding Agent
+# Wallace
 
-A command-line coding agent built with LangChain, Ollama, and LangGraph. It can
-answer questions, search the LangChain documentation through its MCP server,
-inspect project files, write and edit files, and execute shell commands or tests.
+Wallace is a personal assistant and workhorse being built with LangChain, Ollama,
+and LangGraph. Today, Wallace can answer questions, search the LangChain
+documentation through its MCP server, inspect project files, write and edit
+files, and execute shell commands or tests.
 
 ## What it can do today
 
@@ -21,17 +22,22 @@ from the project root using the permissions of the local agent process.
 
 ## Long-term goal
 
-The goal is to develop this into a fully capable coding agent that can:
+The goal is to develop Wallace into an all-around creative and productivity
+assistant that can:
 
-1. Read and understand its own source code and the rest of the project.
-2. Propose, write, and edit code changes in any programming language.
-3. Run approved commands, tests, and other code to verify changes.
-4. Explain what it changed and show a Git diff for review.
-5. Communicate fluently in all spoken and programming languages.
-6. Speak and listen to the user via the device's microphone and speaker.
-7. Have a user interface.
+1. Understand and work with projects, documents, and information across the
+   user's workspaces.
+2. Create, understand, and edit code in any computing language.
+3. Communicate fluently across spoken languages, adapting to the user's needs.
+4. Speak and listen to the user through the computer's speaker and microphone.
+5. Access the web and, with the user's authorization, cloud workspaces such as
+   Google Workspace.
+6. Help with a broad range of creative, practical, and productivity tasks as a
+   capable everyday workhorse.
+7. Provide a useful interface for both text-based and voice-based interaction.
 
-The agent has evolved to support writing/editing files and executing shell commands/tests, functioning as a fully capable coding agent.
+These are long-term goals; web, cloud-workspace, and voice integrations are not
+implied to be available in the current version.
 
 ## Setup
 
