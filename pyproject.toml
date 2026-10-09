@@ -16,6 +16,7 @@ dependencies = [
     "langchain-tools>=0.1.34",
     "textual>=0.80.0",
     "langchain-core>=1.6.7",
+    "watchfiles>=1.0.0",
 ]
 
 [project.scripts]
@@ -24,6 +25,11 @@ agent = "main:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# The project and uv's cache may be on different mounts. Copying avoids the
+# hardlink warning while keeping the environment independent of the cache.
+link-mode = "copy"
 
 [tool.hatch.build.targets.wheel]
 include = ["*.py"]

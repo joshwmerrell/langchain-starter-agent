@@ -1,7 +1,11 @@
 import asyncio
+import json
+import os
 import sys
+import tempfile
 import uuid
 from collections.abc import Callable, Sequence
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -33,6 +37,8 @@ load_dotenv()
 
 console = Console()
 
+CONVERSATION_PATH = Path(__file__).resolve().parent / ".wallace" / "conversation.json"
+
 MCP_URL = "https://docs.langchain.com/mcp"
 MCP_TIMEOUT_SECONDS = 15
 
@@ -48,6 +54,11 @@ MALFORMED_TOOL_CALL_RETRY_PROMPT = (
     "Use the smallest valid tool call possible. For small edits use "
     "replace_in_file; use write_safe_file only for a short new file or a "
     "complete rewrite. Return valid JSON tool arguments only."
+)
+
+EMPTY_RESPONSE_RETRY_PROMPT = (
+    "Provide a concise text response for the user summarizing the work completed "
+    "in this turn. Do not call any tools; explain any limitation plainly."
 )
 
 # Tools that pause for the user's approval before they run (defined in tools.py).
@@ -92,6 +103,9 @@ Work efficiently:
 - Explore with `get_project_tree` and `search_in_files`, then read only what
   you need. For large files, use `get_code_symbols` to find line numbers and
   `read_safe_file` with start_line/end_line.
+- For architecture questions, use `summarize_project_file`,
+  `analyze_project_dependencies`, and `analyze_git_change_impact` to inspect
+  imports, dependents, and likely change impact.
 - Change existing files with `replace_in_file` (copy old_text exactly from the
   file). Use `write_safe_file` only for short new files or complete rewrites;
   never use it for a small edit to an existing file.
@@ -107,6 +121,87 @@ briefly say what you did not do and ask how they would like to proceed.
 # ---------------------------------------------------------------------------
 # Shared helpers (used by both this CLI and tui_agent.py)
 # ---------------------------------------------------------------------------
+
+class ConversationStore:
+    """Persist completed text turns so a TUI reload can restore the context."""
+
+    def __init__(self, path: Path = CONVERSATION_PATH) -> None:
+        self.path = path
+
+    def load(self) -> list[dict[str, str]]:
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(raw, list):
+            return []
+
+        history: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if (
+                role in {"user", "assistant"}
+                and isinstance(content, str)
+                and content.strip()
+            ):
+                history.append({"role": role, "content": content})
+        return history
+
+    def save(self, history: Sequence[dict[str, str]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except OSError:
+            pass
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix="conversation-",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump(list(history), temporary, ensure_ascii=False, indent=2)
+                temporary.write("\n")
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, self.path)
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+def _content_text(content: object) -> str | None:
+    """Extract displayable text from common LangChain content shapes."""
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                if block.strip():
+                    parts.append(block.strip())
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts).strip() or None
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
 
 def assistant_response_text(messages: Sequence[BaseMessage]) -> str | None:
     """Extract the assistant's text for the current turn.
@@ -125,16 +220,9 @@ def assistant_response_text(messages: Sequence[BaseMessage]) -> str | None:
     # 1. Search for any AI text response generated in this turn
     for msg in current_turn_messages:
         if isinstance(msg, AIMessage):
-            if isinstance(msg.content, str) and msg.content.strip():
-                return msg.content.strip()
-            elif isinstance(msg.content, list):
-                text_parts = [
-                    block["text"]
-                    for block in msg.content
-                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-                ]
-                if text_parts:
-                    return "\n".join(text_parts).strip()
+            text = _content_text(msg.content)
+            if text:
+                return text
 
     # 2. Fallback: AI executed tools but provided no text summary
     tool_outputs = []

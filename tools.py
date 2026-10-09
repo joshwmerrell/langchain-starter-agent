@@ -1,5 +1,6 @@
 import ast
 import difflib
+import json
 import os
 import platform
 import re
@@ -12,6 +13,8 @@ from pathlib import Path
 
 from langchain.tools import tool
 
+from dependency_analysis import DependencyGraph, analyze_change_impact
+
 # Files outside this directory can never be accessed by the agent.
 SAFE_ROOT = Path(__file__).resolve().parent
 
@@ -19,11 +22,11 @@ SAFE_ROOT = Path(__file__).resolve().parent
 # path component (case-insensitive).
 SENSITIVE_PATTERNS = [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*"]
 
-# Never readable or writable (git internals can hold credentials and hooks).
-HIDDEN_DIRS = {".git"}
+# Never readable or writable (git internals and Wallace's private state).
+HIDDEN_DIRS = {".git", ".wallace"}
 
 # Hidden from trees and searches, and never writable.
-SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv"}
+SKIP_DIRS = {".git", ".wallace", "node_modules", "__pycache__", ".venv", "venv"}
 
 # Output limits keep tool results small, which matters with a local model's
 # limited context window.
@@ -415,6 +418,68 @@ def check_python_syntax(path: str) -> str:
     return f"OK: {path} has valid Python syntax."
 
 
+@tool
+def summarize_project_file(path: str) -> str:
+    """Summarize a Python project file's public API and dependency relationships.
+
+    Args:
+        path: Python file path relative to the project root.
+    """
+    target = _resolve(path)
+    if target is None or not target.is_file() or target.suffix != ".py":
+        return f"Error: '{path}' is not an accessible Python file."
+    graph = DependencyGraph(SAFE_ROOT).build()
+    return json.dumps(graph.summarize_module(target), indent=2)
+
+
+@tool
+def analyze_project_dependencies() -> str:
+    """Build a project-wide Python import graph and report module relationships."""
+    graph = DependencyGraph(SAFE_ROOT).build()
+    lines = [f"Analyzed {len(graph.modules)} modules and packages."]
+    for module in sorted(name for name in graph.modules if (SAFE_ROOT / f"{name}.py").is_file()):
+        imports = ", ".join(sorted(graph.modules[module])) or "none"
+        dependents = ", ".join(graph.get_dependents(module)) or "none"
+        lines.append(f"{module}: imports [{imports}]; dependents [{dependents}]")
+    return "\n".join(lines)
+
+
+@tool
+def analyze_git_change_impact(staged: bool = False) -> str:
+    """Analyze current Git changes and report affected Python modules."""
+    command = ["git", "diff", "--name-status"]
+    if staged:
+        command.append("--cached")
+    result = subprocess.run(
+        command,
+        cwd=SAFE_ROOT,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        stdin=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        return f"Error: git diff failed ({result.stderr.strip()})."
+
+    changes = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 2:
+            continue
+        status, path = fields[0], fields[-1]
+        hunk = (
+            {"added": True}
+            if status.startswith("A")
+            else {"deleted": True}
+            if status.startswith("D")
+            else {"modified": True}
+        )
+        changes.append({"old_file": path, "new_file": path, "hunks": [hunk]})
+    graph = DependencyGraph(SAFE_ROOT).build()
+    impacts = analyze_change_impact({"diff": changes}, graph)
+    return json.dumps(impacts, indent=2) if impacts else "No Git changes found."
+
+
 # ---------------------------------------------------------------------------
 # Changing files (these require the user's approval; see TOOLS_REQUIRING_APPROVAL)
 # ---------------------------------------------------------------------------
@@ -566,6 +631,9 @@ TOOLS = [
     search_in_files,
     get_code_symbols,
     check_python_syntax,
+    summarize_project_file,
+    analyze_project_dependencies,
+    analyze_git_change_impact,
     write_safe_file,
     replace_in_file,
     execute_command,

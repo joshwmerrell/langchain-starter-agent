@@ -10,6 +10,9 @@ wheels/
 .venv
 .env
 
+# Wallace's local, reload-persistent conversation
+.wallace/
+
 # Personal computer
 agent.bat
 agent.lnk

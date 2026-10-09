@@ -7,6 +7,7 @@ Approvals: y = approve, n / Esc = reject (when the agent wants to run a command 
 """
 
 import asyncio
+import os
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -29,6 +30,8 @@ from textual.widgets import (
 
 from main import (
     assistant_response_text,
+    ConversationStore,
+    EMPTY_RESPONSE_RETRY_PROMPT,
     describe_error,
     extract_action_requests,
     format_action_request,
@@ -39,6 +42,18 @@ from main import (
     setup_agent,
 )
 from tools import SAFE_ROOT, SENSITIVE_PATTERNS, SKIP_DIRS
+
+
+def _write_reload_status(status: str) -> None:
+    status_path = os.environ.get("WALLACE_RELOAD_STATUS")
+    if not status_path:
+        return
+    try:
+        path = Path(status_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(status, encoding="utf-8")
+    except OSError:
+        pass
 
 
 WALLACE_THEME = {
@@ -76,20 +91,48 @@ def _styled_detail(detail: str) -> Text:
     return text
 
 
+def _allowed_workspace_path(path: Path) -> bool:
+    """Whether a resolved workspace path is safe to show or track."""
+    try:
+        parts = path.relative_to(SAFE_ROOT).parts
+    except ValueError:
+        return False
+    if any(part in SKIP_DIRS for part in parts):
+        return False
+    return not any(
+        fnmatch(part.lower(), pattern)
+        for part in parts
+        for pattern in SENSITIVE_PATTERNS
+    )
+
+
+def _workspace_file_state() -> dict[str, tuple[int, int]]:
+    """Return safe workspace files mapped to (size, mtime_ns)."""
+    state: dict[str, tuple[int, int]] = {}
+    for root, directories, files in os.walk(SAFE_ROOT):
+        directories[:] = sorted(
+            directory for directory in directories if directory not in SKIP_DIRS
+        )
+        for name in files:
+            path = (Path(root) / name).resolve()
+            if not _allowed_workspace_path(path):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            relative = path.relative_to(SAFE_ROOT).as_posix()
+            state[relative] = (stat.st_size, stat.st_mtime_ns)
+    return state
+
+
 def _workspace_tree(max_depth: int = 3, max_entries: int = 140) -> Text:
     """Build a bounded, secret-filtered tree for the workspace panel."""
     text = Text()
     count = 0
 
     def allowed(path: Path) -> bool:
-        parts = path.relative_to(SAFE_ROOT).parts
-        if any(part in SKIP_DIRS for part in parts):
-            return False
-        return not any(
-            fnmatch(part.lower(), pattern)
-            for part in parts
-            for pattern in SENSITIVE_PATTERNS
-        )
+        return _allowed_workspace_path(path)
 
     def visit(directory: Path, prefix: str, depth: int) -> None:
         nonlocal count
@@ -127,6 +170,11 @@ def _workspace_tree(max_depth: int = 3, max_entries: int = 140) -> Text:
 class WorkspacePanel(Vertical):
     """Live, read-only view of the agent's project workspace."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._file_state: dict[str, tuple[int, int]] | None = None
+        self._pending_changes: list[str] = []
+
     def compose(self) -> ComposeResult:
         yield Static("WORKSPACE", id="workspace_title")
         with VerticalScroll(id="workspace_tree_scroll"):
@@ -134,10 +182,36 @@ class WorkspacePanel(Vertical):
         yield Static("ACTIVITY", id="workspace_activity_title")
         yield Static("Waiting for work", id="workspace_activity")
 
-    def refresh_view(self, activity: str | None = None) -> None:
+    def refresh_view(self, activity: str | None = None) -> list[str]:
+        current_state = _workspace_file_state()
+        changes: list[str] = []
+        if self._file_state is not None:
+            for path in sorted(current_state.keys() - self._file_state.keys()):
+                changes.append(f"added {path}")
+            for path in sorted(self._file_state.keys() - current_state.keys()):
+                changes.append(f"removed {path}")
+            for path in sorted(current_state.keys() & self._file_state.keys()):
+                if current_state[path] != self._file_state[path]:
+                    changes.append(f"modified {path}")
+        self._file_state = current_state
+        if changes:
+            self._pending_changes.extend(changes)
         self.query_one("#workspace_tree", Static).update(_workspace_tree())
         if activity is not None:
             self.query_one("#workspace_activity", Static).update(activity)
+        elif changes:
+            preview = ", ".join(changes[:3])
+            if len(changes) > 3:
+                preview += f" (+{len(changes) - 3} more)"
+            self.query_one("#workspace_activity", Static).update(
+                f"Workspace changed: {preview}"
+            )
+        return changes
+
+    def consume_changes(self) -> list[str]:
+        changes = list(dict.fromkeys(self._pending_changes))
+        self._pending_changes.clear()
+        return changes
 
 
 class SelectableRichLog(RichLog):
@@ -341,6 +415,9 @@ class AgentTUI(App):
         self.thread_config = None
         self.workspace_panel = None
         self._workspace_width = 30
+        self.conversation_store = ConversationStore()
+        self._conversation_history: list[dict[str, str]] = []
+        self._history_seed_pending = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -359,6 +436,8 @@ class AgentTUI(App):
         self.workspace_panel = self.query_one("#workspace_panel", WorkspacePanel)
         self.workspace_panel.refresh_view()
         self.set_interval(2.0, self._refresh_workspace)
+        self._conversation_history = self.conversation_store.load()
+        self._history_seed_pending = bool(self._conversation_history)
         self._thinking_messages = (
             "Mapping the next move",
             "Reading the signals",
@@ -375,6 +454,7 @@ class AgentTUI(App):
             "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
         )
         self._busy = False
+        _write_reload_status("busy")
         self._rotate_thinking_status = False
         self.set_interval(0.35, self._advance_thinking_status)
         self.chat_log.write(
@@ -391,10 +471,32 @@ class AgentTUI(App):
             "Tip: select chat text with the mouse and press Ctrl+C to copy it. "
             "The input bar supports normal Ctrl+C/Ctrl+V shortcuts."
         )
+        self._restore_conversation()
         self.chat_log.write(
             Text("Initializing Wallace...", style=WALLACE_THEME["warning"])
         )
         self.initialize_agent()
+
+    def _restore_conversation(self) -> None:
+        if not self._conversation_history:
+            return
+        self.chat_log.write(
+            Text(
+                f"Restored {len(self._conversation_history) // 2} previous turn(s).",
+                style=WALLACE_THEME["success"],
+            )
+        )
+        for message in self._conversation_history:
+            if message["role"] == "user":
+                line = Text()
+                line.append("\nUser: ", style=f"bold {WALLACE_THEME['user']}")
+                line.append(message["content"])
+                self.chat_log.write(line)
+            else:
+                self.chat_log.write(
+                    Text("AI:", style=f"bold {WALLACE_THEME['assistant']}")
+                )
+                self.chat_log.write(Markdown(message["content"]))
 
     # ---------- setup ----------
 
@@ -418,6 +520,7 @@ class AgentTUI(App):
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        _write_reload_status("busy" if busy else "idle")
         self.prompt_input.disabled = busy
         self.prompt_input.placeholder = (
             "Wallace is working... (Esc to cancel)"
@@ -472,15 +575,43 @@ class AgentTUI(App):
         self.chat_log.write(user_line)
 
         self._set_busy(True)
-        self.run_turn(prompt)
+        agent_prompt = prompt
+        if self.workspace_panel is not None:
+            changes = self.workspace_panel.consume_changes()
+            if changes:
+                change_text = ", ".join(changes[:8])
+                if len(changes) > 8:
+                    change_text += f" (+{len(changes) - 8} more)"
+                agent_prompt = (
+                    "Workspace changes detected since the previous turn: "
+                    f"{change_text}. Re-read the affected files with the project "
+                    "tools before relying on their previous contents.\n\n"
+                    f"User request: {prompt}"
+                )
+        seed_messages = (
+            [*self._conversation_history] if self._history_seed_pending else None
+        )
+        self.run_turn(
+            agent_prompt,
+            user_prompt=prompt,
+            seed_messages=seed_messages,
+        )
 
     # ---------- agent turn ----------
 
     @work(exclusive=True, group="turn")
-    async def run_turn(self, prompt: str) -> None:
+    async def run_turn(
+        self,
+        prompt: str,
+        *,
+        user_prompt: str | None = None,
+        seed_messages: list[dict[str, str]] | None = None,
+    ) -> None:
         turn_messages = []
-        payload = {"messages": [{"role": "user", "content": prompt}]}
+        payload_messages = [*(seed_messages or []), {"role": "user", "content": prompt}]
+        payload = {"messages": payload_messages}
         recovery_attempts = 0
+        empty_response_retried = False
         try:
             while True:
                 interrupts = []
@@ -507,10 +638,11 @@ class AgentTUI(App):
                         )
                         payload = {
                             "messages": [
+                                *payload_messages,
                                 {
                                     "role": "user",
                                     "content": MALFORMED_TOOL_CALL_RETRY_PROMPT,
-                                }
+                                },
                             ]
                         }
                         continue
@@ -540,6 +672,47 @@ class AgentTUI(App):
 
             response = assistant_response_text(turn_messages)
             if response is None:
+                # A streamed updates event may omit the final model message,
+                # particularly after a long-running thread. Read the
+                # checkpointed state before reporting an empty response.
+                try:
+                    state = await self.agent.aget_state(self.thread_config)
+                    stored_messages = state.values.get("messages", [])
+                    response = assistant_response_text(stored_messages)
+                except Exception:
+                    # The normal response is still the useful path; if state
+                    # lookup is unavailable, retain the existing fallback.
+                    pass
+            if response is None and not empty_response_retried:
+                empty_response_retried = True
+                self._write_warning(
+                    "The model completed the turn without a text response; "
+                    "requesting a concise summary once."
+                )
+                retry_messages = []
+                retry_payload = {
+                    "messages": [
+                        {"role": "user", "content": EMPTY_RESPONSE_RETRY_PROMPT}
+                    ]
+                }
+                async for update in self.agent.astream(
+                    retry_payload, self.thread_config, stream_mode="updates"
+                ):
+                    for key, output in update.items():
+                        if key == "__interrupt__":
+                            continue
+                        messages = (
+                            output.get("messages")
+                            if isinstance(output, dict)
+                            else None
+                        )
+                        if not isinstance(messages, list):
+                            continue
+                        for msg in messages:
+                            retry_messages.append(msg)
+                            self._show_progress(msg)
+                response = assistant_response_text(retry_messages)
+            if response is None:
                 self.chat_log.write(
                     Text(
                         "The agent finished without a text response.",
@@ -551,6 +724,15 @@ class AgentTUI(App):
                     Text("AI:", style=f"bold {WALLACE_THEME['assistant']}")
                 )
                 self.chat_log.write(Markdown(response))
+                if user_prompt is not None:
+                    self._conversation_history.extend(
+                        [
+                            {"role": "user", "content": user_prompt},
+                            {"role": "assistant", "content": response},
+                        ]
+                    )
+                    self.conversation_store.save(self._conversation_history)
+                    self._history_seed_pending = False
 
         except Exception as error:
             self._write_warning(describe_error(error))
@@ -611,7 +793,7 @@ class AgentTUI(App):
         self.chat_log.clear()
 
     def _refresh_workspace(self) -> None:
-        if self.workspace_panel is not None and self.workspace_panel.display:
+        if self.workspace_panel is not None:
             self.workspace_panel.refresh_view()
 
     def action_toggle_workspace(self) -> None:
@@ -637,6 +819,9 @@ class AgentTUI(App):
             self.chat_log.write(
                 Text("Request cancelled.", style=WALLACE_THEME["warning"])
             )
+
+    def on_unmount(self) -> None:
+        _write_reload_status("idle")
 
 
 if __name__ == "__main__":

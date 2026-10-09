@@ -13,7 +13,7 @@ files, and execute shell commands or tests.
 - List project directories with `list_directory`, read UTF-8 project files
   with `read_safe_file`, and write/edit project files with `write_safe_file`.
 - Execute shell commands and tests using `execute_command`.
-- Keep conversation state in memory for the duration of one run.
+- Keep CLI conversation state in memory and persist completed TUI turns for reloads.
 - Continue working with its local project tools if the documentation MCP
   server is unavailable.
 
@@ -60,6 +60,10 @@ implied to be available in the current version.
 
 4. Close and reopen your terminal so the updated PATH is available.
 
+Wallace configures `uv` to copy cached package files into the environment.
+This avoids hardlink warnings on systems where the project and uv cache are on
+different filesystems.
+
 ## Run and use it
 
 Start the agent from a terminal:
@@ -80,6 +84,21 @@ To use the Terminal User Interface (TUI), run:
 uv run tui_agent.py
 ```
 
+For development, you can start the TUI under an automatic reload watcher:
+
+```bash
+uv run dev_tui.py
+```
+
+That command starts Wallace and restarts the TUI when a Python file changes.
+If Wallace is in the middle of a turn or waiting for approval, the reload is
+queued until the turn finishes, so editing a Python file no longer cuts off the
+agent. This is still a process restart rather than an in-place replacement of
+Python classes. Completed TUI turns are restored from
+`.wallace/conversation.json` after the restart. Delete that file when you want
+to start a fresh TUI conversation. The normal `uv run tui_agent.py` command
+remains unchanged.
+
 Type a question at the `Input:` prompt. For example:
 
 - `Search the LangChain docs for how to create an agent with tools.`
@@ -92,8 +111,9 @@ connection; if the MCP server cannot be reached, the agent reports the issue
 and continues with the local project-reading tools.
 
 The CLI displays a status while it connects to documentation tools and while
-it waits for a response. Conversation memory is in-process and is lost when
-the program exits. The agent uses its tools to inspect or modify project files;
+it waits for a response. The CLI conversation is in-process; the TUI saves
+completed turns in the local, git-ignored `.wallace/conversation.json` file so
+they can be restored after a development reload. The agent uses its tools to inspect or modify project files;
 the model itself does not have direct access to the filesystem. Empty model
 responses and Ollama request failures are reported, and the CLI remains ready
 for another prompt.

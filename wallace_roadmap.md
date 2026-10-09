@@ -1,9 +1,9 @@
 # Wallace Roadmap
 
 **Version:** 1.0  
-**Last Updated:** *(fill in date)*  
-**Active Track:** A — Core Intelligence  
-**Current Step:** 1 — Project Understanding  
+**Last Updated:** 2026-10-08
+**Active Track:** A — Core Intelligence
+**Current Step:** 2 — Cross-Language Code Operations
 
 ---
 
@@ -26,7 +26,7 @@ An agent interacting with this roadmap should follow these steps in order:
 | Field | Value |
 |------|------|
 | Active Track | A — Core Intelligence |
-| Current Step | 1 — Project Understanding |
+| Current Step | 2 — Cross-Language Code Operations |
 | Progress in Track | 1 / 3 |
 
 ---
@@ -38,6 +38,8 @@ An agent interacting with this roadmap should follow these steps in order:
 #### Step 1 — Project Understanding
 **Goal:** Deepen project/tool awareness beyond simple file reads.
 
+**Status:** Complete — 2026-10-08
+
 | Capability | Implementation ideas |
 |------------|----------------------|
 | Multi-file semantic understanding | Summarize cross-file relationships, imports, and data flows |
@@ -45,7 +47,13 @@ An agent interacting with this roadmap should follow these steps in order:
 | Change impact analysis | Given a Git diff, predict affected modules/tests |
 | Code summarization | Generate concise explanations of modules/functions |
 
-**Milestone:** A tool that takes a Git diff and outputs a human-readable impact summary.
+**Implementation:** `dependency_analysis.py` now builds a Python import graph,
+summarizes modules, compares dependency versions, and analyzes changed files.
+Wallace exposes these capabilities through `summarize_project_file`,
+`analyze_project_dependencies`, and `analyze_git_change_impact`.
+
+**Milestone:** Completed with a read-only Git change-impact tool and project
+dependency-analysis tools.
 
 ---
 

@@ -1320,6 +1320,7 @@ dependencies = [
     { name = "rich" },
     { name = "textual" },
     { name = "uuid" },
+    { name = "watchfiles" },
 ]
 
 [package.metadata]
@@ -1335,6 +1336,7 @@ requires-dist = [
     { name = "rich", specifier = ">=15.0.0" },
     { name = "textual", specifier = ">=0.80.0" },
     { name = "uuid", specifier = ">=1.30" },
+    { name = "watchfiles", specifier = ">=1.0.0" },
 ]
 
 [[package]]
