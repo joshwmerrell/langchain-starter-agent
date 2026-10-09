@@ -421,7 +421,11 @@ def check_python_syntax(path: str) -> str:
 
 @tool
 def write_safe_file(path: str, content: str) -> str:
-    """Create a new file or fully overwrite an existing one. For small changes to an existing file, use replace_in_file instead.
+    """Create a short new file or fully rewrite an existing file.
+
+    For small changes to an existing file, use replace_in_file instead. Avoid
+    sending large file contents through this tool unless a complete rewrite is
+    explicitly required.
 
     Args:
         path: File path relative to the project root.
@@ -441,7 +445,10 @@ def write_safe_file(path: str, content: str) -> str:
 
 @tool
 def replace_in_file(path: str, old_text: str, new_text: str) -> str:
-    """Edit a file by replacing one exact block of text. old_text must match exactly once, so include enough surrounding lines to be unique.
+    """Edit a file by replacing one exact block of text.
+
+    Prefer this tool for small edits to existing files. old_text must match
+    exactly once, so include enough surrounding lines to be unique.
 
     Args:
         path: File path relative to the project root.

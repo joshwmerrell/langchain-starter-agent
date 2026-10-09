@@ -40,6 +40,16 @@ MCP_TIMEOUT_SECONDS = 15
 # 25 tool calls in one turn.
 RECURSION_LIMIT = 50
 
+# A malformed tool call is a model-output problem. Retry once with a short,
+# explicit instruction so the model can regenerate the call without allowing
+# an infinite retry loop.
+MALFORMED_TOOL_CALL_RETRY_PROMPT = (
+    "Retry the same request. Your previous tool call contained malformed JSON. "
+    "Use the smallest valid tool call possible. For small edits use "
+    "replace_in_file; use write_safe_file only for a short new file or a "
+    "complete rewrite. Return valid JSON tool arguments only."
+)
+
 # Tools that pause for the user's approval before they run (defined in tools.py).
 APPROVAL_REQUIRED = {
     name: {"allowed_decisions": ["approve", "reject"]}
@@ -83,7 +93,8 @@ Work efficiently:
   you need. For large files, use `get_code_symbols` to find line numbers and
   `read_safe_file` with start_line/end_line.
 - Change existing files with `replace_in_file` (copy old_text exactly from the
-  file). Use `write_safe_file` only for new files or complete rewrites.
+  file). Use `write_safe_file` only for short new files or complete rewrites;
+  never use it for a small edit to an existing file.
 - After editing Python, run `check_python_syntax`, and `run_tests` if the
   project has tests.
 
@@ -157,6 +168,15 @@ def describe_error(error: Exception) -> str:
             f"the configured model is available, then try again. Details: {error}"
         )
     return f"Unexpected error ({type(error).__name__}): {error}"
+
+
+def is_malformed_tool_call_error(error: Exception) -> bool:
+    """Whether Ollama rejected incomplete JSON for a generated tool call."""
+    detail = str(error).lower()
+    return (
+        "invalid tool call arguments" in detail
+        and ("unexpected end of json" in detail or "invalid json" in detail)
+    )
 
 
 def extract_action_requests(interrupts) -> list[dict]:
@@ -250,7 +270,10 @@ async def setup_agent(on_status: Callable[[str], None] | None = None):
         model="SetneufPT/Qwopus3.5-9B-Coder_Q3_64k_8GB-GPU:latest",
         base_url="http://localhost:11434",
         temperature=0,
-        num_ctx=16384,
+        # The machine has 32 GiB RAM. 32k gives tool-heavy turns more room
+        # while staying conservative because the NVIDIA driver is unavailable
+        # at setup time and Ollama may need to spill to system memory.
+        num_ctx=32768,
         num_predict=4096,
         keep_alive="15m",
     )
@@ -286,9 +309,25 @@ def _ask_cli_approval(request: dict) -> bool:
 async def _invoke_with_approvals(agent, thread_config, prompt: str) -> dict:
     """Run one turn, pausing for approval whenever the agent asks for it."""
     payload = {"messages": [{"role": "user", "content": prompt}]}
+    recovery_attempts = 0
     while True:
-        with console.status("Thinking..."):
-            result = await agent.ainvoke(payload, thread_config)
+        try:
+            with console.status("Thinking..."):
+                result = await agent.ainvoke(payload, thread_config)
+        except Exception as error:
+            if recovery_attempts < 1 and is_malformed_tool_call_error(error):
+                recovery_attempts += 1
+                console.print(
+                    "[yellow]The model returned malformed tool-call JSON; "
+                    "retrying once with a concise tool instruction.[/yellow]"
+                )
+                payload = {
+                    "messages": [
+                        {"role": "user", "content": MALFORMED_TOOL_CALL_RETRY_PROMPT}
+                    ]
+                }
+                continue
+            raise
         requests = extract_action_requests(result.get("__interrupt__"))
         if not requests:
             return result
