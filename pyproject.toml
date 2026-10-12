@@ -1,7 +1,7 @@
 [project]
 name = "langchain-starter-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "An unfinished local-first AI agent for personal assistance and coding, with an Ollama-backed CLI and TUI"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

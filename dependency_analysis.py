@@ -34,8 +34,13 @@ def _requirement_specifier(value: object) -> str:
     return value[match.end():].strip() if match else ""
 
 
-def _module_name(path: Path) -> str:
-    return path.stem
+def _module_name(path: Path, root: Path = DEFAULT_ROOT) -> str:
+    """Return a package-aware dotted module name for a workspace path."""
+    relative = path.resolve().relative_to(root.resolve())
+    parts = list(relative.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
 
 
 class DependencyGraph:
@@ -45,6 +50,9 @@ class DependencyGraph:
         self.root = root.resolve()
         self.modules: dict[str, set[str]] = defaultdict(set)
         self.reverse_deps: dict[str, set[str]] = defaultdict(set)
+        self.module_paths: dict[str, Path] = {}
+        self.external_imports: dict[str, set[str]] = defaultdict(set)
+        self.declared_dependencies: set[str] = set()
 
     def load_from_pyproject(self, path: Path | None = None) -> None:
         """Load declared project dependencies from pyproject.toml."""
@@ -58,7 +66,26 @@ class DependencyGraph:
         for dependency in data.get("project", {}).get("dependencies", []):
             name = _requirement_name(dependency)
             if name:
-                self.modules.setdefault(name, set())
+                self.declared_dependencies.add(name)
+
+    def module_for_path(self, path: Path | str) -> str:
+        """Return the package-aware module name for a workspace path."""
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.root / target
+        try:
+            return _module_name(target, self.root)
+        except ValueError:
+            return ""
+
+    def _local_import(self, candidate: str) -> str | None:
+        """Resolve the longest local module prefix, if one exists."""
+        parts = [part for part in candidate.split(".") if part]
+        for end in range(len(parts), 0, -1):
+            name = ".".join(parts[:end])
+            if name in self.module_paths:
+                return name
+        return None
 
     def extract_import_dependencies(self, path: Path) -> None:
         """Add imports from one Python file to the graph."""
@@ -69,15 +96,40 @@ class DependencyGraph:
         except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
             return
 
-        module = _module_name(target)
+        module = self.module_for_path(target)
+        if not module:
+            return
+        self.module_paths[module] = target
         imported: set[str] = set()
+        external: set[str] = set()
+
+        relative_path = target.relative_to(self.root)
+        package_parts = list(module.split("."))
+        if relative_path.name != "__init__.py" and package_parts:
+            package_parts.pop()
+
+        def add_import(candidate: str) -> None:
+            local = self._local_import(candidate)
+            if local:
+                imported.add(local)
+            elif candidate:
+                external.add(candidate.split(".", 1)[0])
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                imported.add(node.module.split(".", 1)[0])
+                for alias in node.names:
+                    add_import(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                base = (
+                    []
+                    if node.level == 0
+                    else package_parts[: max(0, len(package_parts) - node.level + 1)]
+                )
+                imported_name = ".".join(base + (node.module or "").split("."))
+                add_import(imported_name)
 
         self.modules[module] = imported
+        self.external_imports[module] = external
         for dependency in imported:
             self.reverse_deps[dependency].add(module)
 
@@ -85,23 +137,30 @@ class DependencyGraph:
         """Load pyproject dependencies and all readable Python modules."""
         self.load_from_pyproject()
         pattern = "**/*.py" if include_nested else "*.py"
+        paths = []
         for path in self.root.glob(pattern):
             if any(
                 part in {".git", ".venv", "venv", "__pycache__", ".wallace", "node_modules"}
                 for part in path.relative_to(self.root).parts
             ):
                 continue
+            module = self.module_for_path(path)
+            if module:
+                self.module_paths[module] = path.resolve()
+                self.modules.setdefault(module, set())
+                paths.append(path)
+        for path in paths:
             self.extract_import_dependencies(path)
         return self
 
     def get_dependents(self, module: str) -> list[str]:
         """Return modules that import the requested module."""
-        name = Path(module).stem
+        name = self.module_for_path(module) if str(module).endswith(".py") else str(module)
         return sorted(self.reverse_deps.get(name, set()))
 
     def get_all_transitive_deps(self, module: str) -> list[str]:
         """Return reachable dependencies in deterministic order."""
-        start = Path(module).stem
+        start = self.module_for_path(module) if str(module).endswith(".py") else str(module)
         visited: set[str] = set()
         result: list[str] = []
         stack = [start]
@@ -147,7 +206,7 @@ class DependencyGraph:
             and not node.name.startswith("_")
         )
         self.extract_import_dependencies(target)
-        name = _module_name(target)
+        name = self.module_for_path(target)
         summary["imports"] = sorted(self.modules.get(name, set()))
         summary["dependents"] = self.get_dependents(name)
         summary["transitive_deps"] = self.get_all_transitive_deps(name)
@@ -173,7 +232,12 @@ def analyze_change_impact(diff: dict[str, Any], dep_graph: DependencyGraph) -> l
         path = new_file or old_file
         if not path:
             continue
-        module = Path(str(path).removeprefix("a/").removeprefix("b/")).stem
+        clean_path = str(path).removeprefix("a/").removeprefix("b/")
+        if not clean_path.endswith(".py"):
+            continue
+        module = dep_graph.module_for_path(clean_path)
+        if not module:
+            continue
         entry = entries.setdefault(
             module,
             {"module": str(path), "changes": [], "severity": "unknown"},

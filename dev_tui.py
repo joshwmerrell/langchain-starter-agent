@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -19,11 +20,30 @@ from watchfiles import Change, watch
 ROOT = Path(__file__).resolve().parent
 TUI_SCRIPT = ROOT / "tui_agent.py"
 STATUS_PATH = ROOT / ".wallace" / "reload_status"
+IDLE_SETTLE_SECONDS = 0.75
+WATCH_SKIP_DIRS = {".git", ".wallace", ".venv", "venv", "node_modules", "__pycache__"}
 
 
 def _write_status(status: str) -> None:
     STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATUS_PATH.write_text(status, encoding="utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=STATUS_PATH.parent,
+            prefix=f".{STATUS_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(status)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, STATUS_PATH)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _is_busy() -> bool:
@@ -64,6 +84,60 @@ def _python_change(change: tuple[Change, str]) -> bool:
     return Path(path).suffix == ".py"
 
 
+def _changed_python_paths(changes: set[tuple[Change, str]]) -> list[Path]:
+    """Return changed Python paths that are inside the project root."""
+    paths = []
+    for change in changes:
+        if not _python_change(change):
+            continue
+        path = Path(change[1]).resolve()
+        relative_parts = path.relative_to(ROOT).parts if path.is_relative_to(ROOT) else ()
+        if relative_parts and not any(
+            part.lower() in WATCH_SKIP_DIRS for part in relative_parts
+        ):
+            paths.append(path)
+    return sorted(set(paths))
+
+
+def _changes_compile(paths: list[Path]) -> bool:
+    """Refuse to restart into a syntax-broken source tree."""
+    for path in paths:
+        if not path.exists():
+            continue
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(path)],
+            cwd=ROOT,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout).strip()
+            print(
+                f"Python change is not reloadable yet: {path.relative_to(ROOT)}\n"
+                f"{details}",
+                flush=True,
+            )
+            return False
+    return True
+
+
+def _wait_for_idle(child: subprocess.Popen) -> bool:
+    """Wait for a stable idle state before stopping the child."""
+    idle_since: float | None = None
+    while child.poll() is None:
+        if not _is_busy():
+            idle_since = idle_since or time.monotonic()
+            if time.monotonic() - idle_since >= IDLE_SETTLE_SECONDS:
+                return True
+        else:
+            idle_since = None
+        time.sleep(0.2)
+    return False
+
+
 def main() -> int:
     child = _start_child()
     try:
@@ -78,16 +152,21 @@ def main() -> int:
             if not any(_python_change(change) for change in changes):
                 continue
 
+            python_paths = _changed_python_paths(changes)
+            if not python_paths:
+                continue
+
             if _is_busy():
                 print(
                     "Wallace is busy; source changes queued until the current "
                     "turn finishes.",
                     flush=True,
                 )
-                while _is_busy() and child.poll() is None:
-                    time.sleep(0.2)
-                if child.poll() is not None:
+                if not _wait_for_idle(child):
                     return child.returncode or 0
+
+            if not _changes_compile(python_paths):
+                continue
 
             print("Source change detected; reloading Wallace.", flush=True)
             _stop_child(child)

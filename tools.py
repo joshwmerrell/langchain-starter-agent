@@ -5,8 +5,10 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 
 from fnmatch import fnmatch
 from pathlib import Path
@@ -35,6 +37,8 @@ MAX_OUTPUT_CHARS = 4000
 MAX_SEARCH_MATCHES = 50
 MAX_SEARCH_FILE_BYTES = 1_000_000
 MAX_TREE_ENTRIES = 300
+MAX_WRITE_CHARS = 50_000
+MAX_REPLACEMENT_CHARS = 25_000
 COMMAND_TIMEOUT = 30
 TEST_TIMEOUT = 60
 
@@ -50,7 +54,7 @@ def _is_allowed(resolved: Path) -> bool:
     if not resolved.is_relative_to(SAFE_ROOT):
         return False
     parts = resolved.relative_to(SAFE_ROOT).parts
-    if any(part in HIDDEN_DIRS for part in parts):
+    if any(part.lower() in SKIP_DIRS for part in parts):
         return False
     return not any(
         fnmatch(part.lower(), pattern)
@@ -74,13 +78,35 @@ def _resolve(path: str) -> Path | None:
 
 
 def _resolve_writable(path: str) -> Path | None:
-    """Like _resolve, but also refuses paths inside skipped dirs (.venv, etc.)."""
+    """Resolve a path that may be written by an approved tool."""
     target = _resolve(path)
-    if target is None:
-        return None
-    if any(part in SKIP_DIRS for part in target.relative_to(SAFE_ROOT).parts):
-        return None
     return target
+
+
+def _atomic_write_text(target: Path, content: str) -> None:
+    """Write text beside the target and replace it atomically."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if mode is not None:
+            os.chmod(temporary_path, mode)
+        os.replace(temporary_path, target)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +436,9 @@ def check_python_syntax(path: str) -> str:
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
     try:
-        ast.parse(target.read_text(encoding="utf-8"), filename=path)
+        compile(target.read_text(encoding="utf-8"), path, "exec", dont_inherit=True)
     except SyntaxError as error:
-        return f"Syntax error in {path}, line {error.lineno}: {error.msg}"
+        return f"Error: Python syntax error in {path}, line {error.lineno}: {error.msg}"
     except (OSError, UnicodeDecodeError) as error:
         return f"Error reading file: {error}"
     return f"OK: {path} has valid Python syntax."
@@ -436,17 +462,30 @@ def summarize_project_file(path: str) -> str:
 def analyze_project_dependencies() -> str:
     """Build a project-wide Python import graph and report module relationships."""
     graph = DependencyGraph(SAFE_ROOT).build()
-    lines = [f"Analyzed {len(graph.modules)} modules and packages."]
-    for module in sorted(name for name in graph.modules if (SAFE_ROOT / f"{name}.py").is_file()):
+    lines = [f"Analyzed {len(graph.module_paths)} local Python modules."]
+    for module in sorted(graph.module_paths):
         imports = ", ".join(sorted(graph.modules[module])) or "none"
+        external = ", ".join(sorted(graph.external_imports.get(module, set()))) or "none"
         dependents = ", ".join(graph.get_dependents(module)) or "none"
-        lines.append(f"{module}: imports [{imports}]; dependents [{dependents}]")
+        lines.append(
+            f"{module}: imports [{imports}]; external [{external}]; "
+            f"dependents [{dependents}]"
+        )
+    if graph.declared_dependencies:
+        lines.append(
+            "Declared packages: " + ", ".join(sorted(graph.declared_dependencies))
+        )
     return "\n".join(lines)
 
 
 @tool
 def analyze_git_change_impact(staged: bool = False) -> str:
-    """Analyze current Git changes and report affected Python modules."""
+    """Analyze changed Python files and report affected local modules.
+
+    Non-Python changes are intentionally ignored because they cannot be mapped
+    to the Python import graph. Untracked Python files are included for the
+    unstaged view.
+    """
     command = ["git", "diff", "--name-status"]
     if staged:
         command.append("--cached")
@@ -467,6 +506,8 @@ def analyze_git_change_impact(staged: bool = False) -> str:
         if len(fields) < 2:
             continue
         status, path = fields[0], fields[-1]
+        if not path.endswith(".py"):
+            continue
         hunk = (
             {"added": True}
             if status.startswith("A")
@@ -475,6 +516,27 @@ def analyze_git_change_impact(staged: bool = False) -> str:
             else {"modified": True}
         )
         changes.append({"old_file": path, "new_file": path, "hunks": [hunk]})
+
+    if not staged:
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=SAFE_ROOT,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+        )
+        if untracked.returncode == 0:
+            for path in untracked.stdout.splitlines():
+                if path.endswith(".py"):
+                    changes.append({
+                        "old_file": None,
+                        "new_file": path,
+                        "hunks": [{"added": True}],
+                    })
+
+    if not changes:
+        return "No changed Python files found."
     graph = DependencyGraph(SAFE_ROOT).build()
     impacts = analyze_change_impact({"diff": changes}, graph)
     return json.dumps(impacts, indent=2) if impacts else "No Git changes found."
@@ -484,13 +546,28 @@ def analyze_git_change_impact(staged: bool = False) -> str:
 # Changing files (these require the user's approval; see TOOLS_REQUIRING_APPROVAL)
 # ---------------------------------------------------------------------------
 
+def _python_write_error(target: Path, content: str) -> str | None:
+    """Reject invalid Python before replacing the file on disk."""
+    if target.suffix.lower() != ".py":
+        return None
+    relative = target.relative_to(SAFE_ROOT).as_posix()
+    try:
+        compile(content, relative, "exec", dont_inherit=True)
+    except SyntaxError as error:
+        return (
+            f"Error: Python syntax error in {relative}, line {error.lineno}: "
+            f"{error.msg}. File was not changed."
+        )
+    return None
+
+
 @tool
 def write_safe_file(path: str, content: str) -> str:
-    """Create a short new file or fully rewrite an existing file.
+    """Write a short new file; avoid using this for existing files.
 
-    For small changes to an existing file, use replace_in_file instead. Avoid
-    sending large file contents through this tool unless a complete rewrite is
-    explicitly required.
+    For changes to an existing file, use replace_in_file in small blocks.
+    A whole-file overwrite sends much more JSON and should only be used when
+    the user explicitly requests a complete rewrite.
 
     Args:
         path: File path relative to the project root.
@@ -499,10 +576,17 @@ def write_safe_file(path: str, content: str) -> str:
     target = _resolve_writable(path)
     if target is None:
         return "Error: Access denied."
+    if len(content) > MAX_WRITE_CHARS:
+        return (
+            f"Error: content is {len(content)} characters; the maximum is "
+            f"{MAX_WRITE_CHARS}. Use replace_in_file for a small edit."
+        )
+    syntax_error = _python_write_error(target, content)
+    if syntax_error is not None:
+        return syntax_error
     existed = target.exists()
     try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        _atomic_write_text(target, content)
     except OSError as error:
         return f"Error writing {path}: {error}"
     return f"{'Overwrote' if existed else 'Created'} {path} ({len(content)} characters)."
@@ -527,6 +611,11 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
         return "Error: old_text must not be empty."
     if old_text == new_text:
         return "Error: old_text and new_text are identical."
+    if len(new_text) > MAX_REPLACEMENT_CHARS:
+        return (
+            f"Error: replacement is {len(new_text)} characters; the maximum is "
+            f"{MAX_REPLACEMENT_CHARS}. Use a short edit."
+        )
     try:
         text = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
@@ -537,8 +626,12 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
         return "Error: old_text was not found. Re-read the file and copy the text exactly."
     if count > 1:
         return f"Error: old_text matches {count} places. Include more surrounding lines to make it unique."
+    updated = text.replace(old_text, new_text, 1)
+    syntax_error = _python_write_error(target, updated)
+    if syntax_error is not None:
+        return syntax_error
     try:
-        target.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+        _atomic_write_text(target, updated)
     except OSError as error:
         return f"Error writing {path}: {error}"
     return f"Edited {path}."
@@ -578,7 +671,10 @@ def execute_command(command: str) -> str:
 
 @tool
 def run_tests(test_path: str = ".") -> str:
-    """Run pytest (quiet mode, short tracebacks) on the project or one test file/directory.
+    """Run the project's tests on a file or directory.
+
+    Uses pytest when installed and falls back to unittest discovery, so the
+    tool remains useful in a fresh environment.
 
     Args:
         test_path: Test file or directory relative to the project root. Defaults to the whole project.
@@ -587,10 +683,34 @@ def run_tests(test_path: str = ".") -> str:
     if target is None or not target.exists():
         return ACCESS_DENIED
     rel = target.relative_to(SAFE_ROOT).as_posix()
-    return _run_command(
-        [sys.executable, "-m", "pytest", rel, "-q", "--tb=short"],
-        timeout=TEST_TIMEOUT,
+    if _module_available("pytest"):
+        command = [sys.executable, "-m", "pytest", rel, "-q", "--tb=short"]
+    else:
+        discover_root = rel if target.is_dir() else str(Path(rel).parent)
+        command = [sys.executable, "-m", "unittest", "discover", "-s", discover_root]
+        if target.is_file():
+            command.extend(["-p", target.name])
+    return _run_command(command, timeout=TEST_TIMEOUT)
+
+
+def _module_available(name: str) -> bool:
+    """Return whether a Python module can be imported by this interpreter."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib.util; import sys; "
+                "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)"
+            ),
+            name,
+        ],
+        cwd=SAFE_ROOT,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=5,
     )
+    return result.returncode == 0
 
 
 # ---------------------------------------------------------------------------
@@ -644,4 +764,9 @@ TOOLS = [
 ]
 
 # The agent pauses for the user's approval before these run.
-TOOLS_REQUIRING_APPROVAL = {"write_safe_file", "replace_in_file", "execute_command"}
+TOOLS_REQUIRING_APPROVAL = {
+    "write_safe_file",
+    "replace_in_file",
+    "execute_command",
+    "run_tests",
+}

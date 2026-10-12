@@ -1,0 +1,30 @@
+"""Wallace's context-aware planning layer."""
+
+from .archive import ArchiveManager
+from .cli import add_planning_arguments, latest_completed_context, parse_request, planning_context, resume_or_create
+from .executors import PlanExecutor
+from .generators import active_plan, create_plan, list_plans, load_plan, save_plan
+from .models import PlanSpec, PlanStep, SourceRef
+from .quality import response_quality_error
+from .threads import ConversationThreadManager, ThreadRecord
+
+__all__ = [
+    "ArchiveManager",
+    "ConversationThreadManager",
+    "PlanExecutor",
+    "PlanSpec",
+    "PlanStep",
+    "SourceRef",
+    "ThreadRecord",
+    "active_plan",
+    "add_planning_arguments",
+    "create_plan",
+    "list_plans",
+    "latest_completed_context",
+    "load_plan",
+    "parse_request",
+    "planning_context",
+    "response_quality_error",
+    "resume_or_create",
+    "save_plan",
+]
