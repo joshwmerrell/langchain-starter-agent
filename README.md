@@ -1,14 +1,15 @@
 # Wallace
 
 Wallace is an experimental, local-first AI agent being developed into a
-general-purpose personal assistant and coding workhorse. Today it uses an
-Ollama model with LangChain-powered tools and offers both a command-line
-interface and a Textual terminal interface. It can inspect and edit project
+general-purpose personal assistant and coding workhorse. Today it uses a local
+Ollama model or an optional OpenAI/Gemini model with LangChain-powered tools.
+It offers both a command-line interface and a Textual terminal interface. It
+can inspect and edit project
 files, run commands and tests with approval, and keep resumable conversation
 threads and plans.
 
 **Status: work in progress.** Wallace and its [roadmap](wallace_roadmap.md) are
-unfinished. Cross-language code operations, general web research, cloud access,
+unfinished. Cross-language code operations, general web research, cloud workspace access,
 and voice interaction are not complete. Model tool calls and multi-step tasks
 can still fail; review proposed edits and commands, keep backups, and do not
 treat Wallace as production-ready.
@@ -17,15 +18,22 @@ treat Wallace as production-ready.
 
 - Answer questions with a local Ollama model. Configure it with the
   `OLLAMA_MODEL`, `OLLAMA_BASE_URL`, `WALLACE_NUM_CTX`, `WALLACE_NUM_PREDICT`,
-  and `WALLACE_KEEP_ALIVE` environment variables.
+  and `WALLACE_KEEP_ALIVE` environment variables, or switch installed models
+  from inside Wallace with `/model`.
+- Use an OpenAI or Google Gemini model with a key entered in a masked prompt.
+  Wallace can also load provider keys from a private `.env` file.
 - Search and read LangChain documentation using tools provided by
-  `https://docs.langchain.com/mcp`.
+  `https://docs.langchain.com/mcp` (unless disabled with `/mcp off langchain-docs`).
+- Manage remote MCP connections with `/mcp` in the CLI or TUI (or F11 in the
+  TUI). Server links and connection states are visible to Wallace through a
+  read-only tool.
 - List project directories with `get_project_tree`, read UTF-8 project files
   with `read_safe_file`, and write/edit project files with `write_safe_file` or
   `replace_in_file`.
 - Execute shell commands and tests using `execute_command` and `run_tests`.
 - Persist each conversation thread independently so CLI and TUI sessions can be
-  resumed without sharing unrelated history.
+  resumed without sharing unrelated history. Older turns are summarized for
+  the model while the original text remains in the local thread file.
 - Plan every request with bounded, resumable multi-step work under
   `.wallace/plans/`, keeping the model context focused on the current task.
 - Keep independent conversation threads under `.wallace/conversations/`.
@@ -59,9 +67,9 @@ implied to be available in the current version.
 
 ## Install and set up
 
-To run Wallace from this source tree, you need [uv](https://docs.astral.sh/uv/getting-started/installation/),
-[Ollama](https://ollama.com/download), and a locally downloaded Ollama model
-that supports tool calls. The project requires Python 3.13 or newer; its
+To run Wallace from this source tree, you need [uv](https://docs.astral.sh/uv/getting-started/installation/).
+For local models, you also need [Ollama](https://ollama.com/download) and a
+downloaded model that supports tool calls. The project requires Python 3.13 or newer; its
 `.python-version` selects 3.13, and uv can download it for you. A GPU is
 optional, but the model you choose must fit your available memory; see
 [Ollama's GPU guidance](https://docs.ollama.com/gpu) if you want acceleration. You do not
@@ -69,7 +77,7 @@ need Node.js, ESLint, TypeScript, Omarchy, or a separate `watchfiles` install
 just to run the current CLI or TUI. Git is only needed if you must clone the
 source repository first.
 
-1. Install uv and Ollama. These are the commands published by their installers;
+1. Install uv and, if using local models, Ollama. These are the commands published by their installers;
    you can use their linked download pages instead if you prefer not to pipe
    installer scripts into a shell.
 
@@ -102,12 +110,12 @@ source repository first.
    are required. This project configures uv to copy package files rather than
    hardlink them across filesystems.
 
-3. Make sure Ollama is running. Open the Ollama app on macOS/Windows. On Linux,
+3. For local models, make sure Ollama is running. Open the Ollama app on macOS/Windows. On Linux,
    use its installed service or run `ollama serve` in a separate terminal if
    the server is not already running. Wallace connects to
    `http://localhost:11434` by default.
 
-4. Download the model configured in `main.py`, then confirm it appears locally:
+4. For local models, download the model configured in `main.py`, then confirm it appears locally:
 
    ```bash
    ollama pull SetneufPT/Qwopus3.5-9B-Coder_Q3_64k_8GB-GPU:latest
@@ -117,14 +125,17 @@ source repository first.
    That [model](https://ollama.com/SetneufPT/Qwopus3.5-9B-Coder_Q3_64k_8GB-GPU%3Alatest)
    is Wallace's current default, not a requirement to use this particular
    model. To use another tool-capable local model, pull it with `ollama pull`
-   and set `OLLAMA_MODEL` to its exact name before launching Wallace. For
-   example, use `export OLLAMA_MODEL="your-model:tag"` in Bash/Zsh or
+   and choose it in Wallace with `/model <name>`, or set `OLLAMA_MODEL` to its
+   exact name before launching Wallace. For example, use
+   `export OLLAMA_MODEL="your-model:tag"` in Bash/Zsh or
    `$env:OLLAMA_MODEL = "your-model:tag"` in PowerShell. The selected model
-   must be available to the running Ollama server.
+   must be available to the running Ollama server. A model selected inside
+   Wallace takes precedence over `OLLAMA_MODEL` on later starts.
 
 The LangChain documentation lookup needs an internet connection, but Wallace
-can still use its local project tools when that service is unavailable. Web,
-cloud, and voice features in the roadmap are not installed by these steps.
+can still use its local project tools when that service is unavailable. General
+web research, cloud-workspace access, and voice features in the roadmap are not
+installed by these steps. Cloud model access is described below.
 
 ## Run and use it
 
@@ -158,9 +169,12 @@ Each request creates a Markdown plan, a JSON state file, and private input,
 source-reference, and output directories under `.wallace/plans/`. A retry after
 a restart resumes the unfinished plan for the same request; a short
 “continue” request resumes the latest active plan in that conversation thread.
-Plans retain a bounded journal of tool names, targets, and outcomes, but not
-file contents or edit bodies. An implementation plan is not marked complete
-just because Wallace said it would begin: edits, validation, and a final
+Plans retain a bounded journal of tool names, targets, outcomes, and safe error
+categories, but not file contents or edit bodies. They also keep compact
+validation evidence for each changed file and unresolved failed checks when
+older tool calls roll out of the journal. An implementation plan is not marked complete
+just because Wallace said it would begin: relevant checks for changed files, no
+unresolved failed edits or checks, and a final
 response must be observed. Wallace starts a fresh model graph thread after
 every request; the plan checkpoint, not the full prior tool transcript, carries
 forward useful context. Prior assistant replies are not fed back as plan
@@ -189,6 +203,65 @@ Python classes. Completed TUI turns are restored from
 visible log and the saved conversation. The normal `uv run tui_agent.py`
 command remains unchanged.
 
+The watcher now checks changed Python syntax, imports Wallace's modules,
+constructs the TUI, and verifies that local tool names are unique before
+stopping the running TUI. It reports a failed startup and stays active so a
+later file fix can restart Wallace. This is a startup check, not a substitute
+for tests or a guarantee that a new feature behaves correctly.
+
+### Let Wallace build tools
+
+Ask Wallace for one small tool and its acceptance tests at a time. Local tools
+are registered in `tools.py`; changes to that registry need a passing
+`verify_tool_contract` check against a test file that calls the tool's
+`.invoke(...)` method before an implementation plan can complete. New local
+tools require approval by default until explicitly reviewed as read-only.
+Wallace can run `check_source_file` for Python, JavaScript, TypeScript, HTML,
+CSS, shell, JSON, TOML, Go, and Rust files, or `run_language_tests` for Python,
+Deno, npm, Go, and Cargo projects. TypeScript checks use Deno for Deno projects
+and standalone files, or `tsc` for Node projects. Deno checks use cached
+dependencies and do not download packages. These fixed validation commands
+require approval. TypeScript and Rust compiler errors may include type or
+dependency failures, not only syntax errors. HTML/CSS checks are basic parse
+checks, not browser or interaction tests. Optional runtimes and test runners
+must already be installed. A newly added tool is
+available to the live agent after an idle reload, then should be tried in a
+new turn. The current turn can verify its registry entry and tests but cannot
+call a tool that was not in its original agent graph.
+
+For remote MCP servers, type `/mcp` in the CLI or TUI (or press F11 in the TUI)
+to see each server's URL, active choice, and current connection state. The built-in
+`langchain-docs` server is active by default and cannot be removed, but you can
+turn it off. Add a server with `/mcp add <name> <URL> [keywords...]`; use
+`/mcp on <name>`, `/mcp off <name>`, `/mcp toggle <name>`, or
+`/mcp remove <name>` to manage it. `/mcp reload` retries discovery. Wallace
+rebuilds its tool list while keeping the current conversation thread. Active
+choices persist across restarts in `.wallace/mcp_servers.json`; “connected”
+means the most recent tool discovery succeeded, so that status can change
+between sessions. Changes made through the running TUI do not trigger a second
+development-TUI restart. CLI changes and manual edits to the private config
+still refresh a separately running development TUI.
+
+You can also copy `wallace_mcp.example.json` to `.wallace/mcp_servers.json` and
+edit it yourself. This currently supports remote URL-based MCP servers, not
+local stdio commands. HTTPS is required except for loopback HTTP. The optional
+`keywords` help Wallace offer server tools for relevant requests. All
+user-added MCP tool calls require approval; duplicate tool names are skipped.
+URLs with embedded usernames/passwords, query strings, or fragments are
+rejected; do not put tokens in URL paths either, because Wallace can display
+those paths to the model. Authenticated services need a separately managed
+token/OAuth broker. MCP
+servers execute outside Wallace's local file-tool restrictions, so review
+their code, permissions, and approval prompts before enabling them. Do not
+put API keys in the MCP configuration.
+
+Wallace's model has a read-only tool to view these links and no MCP management
+tool. Its project file-edit tools cannot access `.wallace`. This is not an
+absolute security boundary: approved shell commands still run as your OS user
+and could modify private files. Review shell approvals carefully; strict
+protection would require isolating shell execution under a different account
+or sandbox.
+
 Type a question at the `Input:` prompt. For example:
 
 - `Search the LangChain docs for how to create an agent with tools.`
@@ -209,27 +282,99 @@ Wallace keeps the last remaining thread. The CLI also accepts
 `--thread-id <id>` or `--new-thread --thread-title "Title"`.
 Existing `.wallace/conversation.json` history is
 migrated into the default `main` thread the first time Wallace starts.
+Wallace remembers the last selected thread in
+`.wallace/conversations/.active-thread.json` and reopens it after a normal
+restart or development reload. An explicit CLI thread flag overrides the
+saved selection. If the saved thread was removed, Wallace falls back to `main`.
 
 In the TUI input bar, press Up and Down to browse previous inputs from the
 active thread. Your unfinished draft is restored when you move back past the
-newest history entry. The header shows the local weekday, date and time. Tool approval
-dialogs show `Y` for Yes and `N` for No (`Esc` also rejects).
+newest history entry. Use Shift+Left/Right to select characters,
+Ctrl+Shift+Left/Right to select words, and Ctrl+A to select the whole input.
+Ctrl+Left/Right moves by word; Ctrl+Backspace/Alt+Backspace and Ctrl+Delete
+delete words. Ctrl+C/X/V copies, cuts, and pastes; Ctrl+Z undoes and Ctrl+Y
+or Ctrl+Shift+Z redoes an unsent edit. Home/End and their Shift/Ctrl variants
+work as in a single-line editor. The header shows the local weekday, date and
+time. Tool approval dialogs show `Y` for Yes and `N` for No (`Esc` also rejects).
 
 Press F9 or enter `/theme` to open the theme picker. Wallace includes
-`wallace-hacker`, `wallace-retro`, `wallace-elegant`, `wallace-future`,
-`wallace-night-mode`, `wallace-red-light`, and the original `wallace-classic`.
-You can also enter `/theme hacker` (or another name) directly. The selected
-theme is remembered in `.wallace/ui.json` across restarts. On Omarchy systems,
-the picker includes installed `omarchy-<name>` palettes; it reads their colors
-without changing the desktop theme. `ansi-dark` and `ansi-light` use the
-terminal's own color palette, so terminal themes work on other systems too.
+`wallace-hacker`, `wallace-retro`, `wallace-elegant`, `wallace-dark`,
+`wallace-vaporwave`, `wallace-grayscale`, `wallace-night`, `wallace-red`,
+and the original `wallace-classic`.
+`wallace-dark` keeps black surfaces and grayscale body text, with red accents
+for section headings, the active thread, user labels, warnings, errors, and
+the working indicator; `wallace-vaporwave` uses the Electric Arcade palette.
+You can also enter `/theme hacker` (or another name) directly. Old saved
+`wallace-night-mode` and `wallace-red-light` choices load as `wallace-night`
+and `wallace-red`; the removed `wallace-future` falls back to classic. The
+selected theme is remembered in `.wallace/ui.json` across restarts. On Omarchy
+systems, the picker includes installed `omarchy-<name>` palettes. It reads
+their colors without changing the desktop theme. `ansi-dark` and `ansi-light`
+use the terminal's own palette, so terminal themes work on other systems too.
 Textual's other built-in themes are also available in the picker.
+
+In the TUI, press F10 or enter `/models` to list models from Ollama, OpenAI,
+and Gemini. Use `/models ollama`, `/models openai`, or `/models gemini` to
+show one provider. The CLI supports the same commands. Cloud lists use your
+account's API key and may include models that cannot handle Wallace's chat or
+tool calls. Use `/model <exact-name>`
+for a local model, `/model openai:<model-id>`, or
+`/model gemini:<model-id>` to switch without leaving Wallace. The model choice—not its key—is saved in
+`.wallace/model.json`. Switching creates a fresh model session but preserves
+the current conversation thread and history. Invalid local names and failed
+model setup leave the previous selection unchanged.
+
+To use cloud models without entering a key each time, create a `.env` file in
+the project root with the provider keys you need:
+
+```dotenv
+GOOGLE_API_KEY=your_gemini_key_here
+OPENAI_API_KEY=your_openai_key_here
+```
+
+Wallace loads these exact variable names on startup. Existing environment
+variables take precedence over values in `.env`. The `.env` file is ignored by
+Git; keep it private and never commit or paste real keys into chat. Restart
+Wallace after changing `.env`. If a selected provider's key is missing, Wallace
+asks for it in a masked TUI dialog or a no-echo CLI prompt. `/key` temporarily
+overrides the selected provider's configured key for the current session.
+The key is passed to the provider client for HTTP authentication; Wallace does
+not intentionally include it in model messages, tool schemas, or conversation
+files. Keys typed in the masked prompt are kept only for that process. The CLI
+requires an interactive terminal for manual key entry.
+
+Cloud requests send conversation content and relevant tool interactions to the
+provider and may incur charges. Wallace still exposes approved command, test,
+and file-edit tools in cloud mode, as requested. These run under your OS user
+and can potentially read local secrets or alter code that hot-reloads; a
+masked key prompt and scrubbed subprocess environment reduce accidental leaks
+but are **not an isolation boundary**. Review each approval carefully. Strong
+protection against a malicious model would require a separately isolated
+credential broker and sandbox. See the [official OpenAI API authentication
+guidance](https://developers.openai.com/api/reference/overview#authentication)
+and [sandbox security guidance](https://developers.openai.com/api/docs/guides/agents-api/environments/security).
 
 The CLI displays a status while it connects to documentation tools and while
 it waits for a response. Both interfaces persist thread histories in the local,
 git-ignored `.wallace/conversations/` directory so they can be restored after
-a development reload. The agent uses its tools to inspect or modify project files;
-the model itself does not have direct access to the filesystem. Empty model
+a development reload. Wallace retains each thread's saved transcript and
+sends the model a bounded rolling summary of older turns, a recent exchange,
+and the current request. When that exchange grows too long, the selected model makes an
+extra request to update the summary without tools; that turn may take
+longer. If summarization fails, the raw history stays on disk and Wallace
+warns that some older context may be absent from that turn.
+Previous assistant replies in memory are labeled unverified; consequential
+claims still need checking against the project. The TUI restores only recent
+turns in its visible log. History discarded by older Wallace versions cannot
+be recovered, and summaries may omit details even though the saved transcript
+is intact. Clearing or removing a thread also removes its summary and history.
+Obviously copied or looping assistant replies remain in the saved transcript
+but are omitted from model-facing memory. For simple requests without tool
+activity, Wallace retries such a reply once with a clean prompt. Local date
+and time questions use the computer's clock, not the model's training data.
+
+The agent uses its tools to inspect or modify project files; the model itself
+does not have direct access to the filesystem. Empty model
 responses and Ollama request failures are reported, and the CLI remains ready
 for another prompt. File changes, shell commands, and test execution require
 approval in the TUI. If pytest is unavailable, `run_tests` falls back to

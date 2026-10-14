@@ -15,11 +15,13 @@ import time
 from pathlib import Path
 
 from watchfiles import Change, watch
+from wallace_mcp import tui_applied_current_config
 
 
 ROOT = Path(__file__).resolve().parent
 TUI_SCRIPT = ROOT / "tui_agent.py"
 STATUS_PATH = ROOT / ".wallace" / "reload_status"
+MCP_CONFIG_PATH = ROOT / ".wallace" / "mcp_servers.json"
 IDLE_SETTLE_SECONDS = 0.75
 WATCH_SKIP_DIRS = {".git", ".wallace", ".venv", "venv", "node_modules", "__pycache__"}
 
@@ -124,6 +126,53 @@ def _changes_compile(paths: list[Path]) -> bool:
     return True
 
 
+def _changes_smoke() -> bool:
+    """Import and construct the changed application before stopping the live TUI."""
+    command = (
+        "import main, tools, tui_agent; "
+        "names = [tool.name for tool in tools.TOOLS]; "
+        "assert len(names) == len(set(names)), 'duplicate local tool names'; "
+        "tui_agent.AgentTUI()"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", command],
+            cwd=ROOT,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=25,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Source change failed startup preflight: {error}", flush=True)
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()[-3000:]
+        print(f"Source change failed startup preflight:\n{detail}", flush=True)
+        return False
+    return True
+
+
+def _wait_for_ready(child: subprocess.Popen, timeout: float = 35.0) -> bool:
+    """Confirm the restarted child reaches its normal idle state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if child.poll() is not None:
+            print(f"Reloaded Wallace exited with code {child.returncode}; watcher remains active for a fix.", flush=True)
+            return False
+        if not _is_busy():
+            return True
+        time.sleep(0.2)
+    print("Reloaded Wallace has not reported ready yet; watcher remains active.", flush=True)
+    return False
+
+
+def _config_change(changes: set[tuple[Change, str]]) -> bool:
+    changed = any(Path(path).resolve() == MCP_CONFIG_PATH for _, path in changes)
+    return changed and not tui_applied_current_config(ROOT)
+
+
 def _wait_for_idle(child: subprocess.Popen) -> bool:
     """Wait for a stable idle state before stopping the child."""
     idle_since: float | None = None
@@ -140,6 +189,7 @@ def _wait_for_idle(child: subprocess.Popen) -> bool:
 
 def main() -> int:
     child = _start_child()
+    crash_reported = False
     try:
         for changes in watch(
             ROOT,
@@ -147,30 +197,49 @@ def main() -> int:
             step=100,
             yield_on_timeout=True,
         ):
-            if child.poll() is not None:
-                return child.returncode or 0
-            if not any(_python_change(change) for change in changes):
+            if child.poll() is not None and not crash_reported:
+                print(
+                    f"Wallace exited with code {child.returncode}; the watcher will retry after a source fix.",
+                    flush=True,
+                )
+                crash_reported = True
+            config_changed = _config_change(changes)
+            if not config_changed and not any(_python_change(change) for change in changes):
                 continue
 
             python_paths = _changed_python_paths(changes)
-            if not python_paths:
+            if not python_paths and not config_changed:
                 continue
 
-            if _is_busy():
+            if child.poll() is None and _is_busy():
                 print(
                     "Wallace is busy; source changes queued until the current "
                     "turn finishes.",
                     flush=True,
                 )
                 if not _wait_for_idle(child):
-                    return child.returncode or 0
+                    print("Wallace exited while a reload was queued; checking the new source.", flush=True)
 
             if not _changes_compile(python_paths):
                 continue
+            if not _changes_smoke():
+                continue
+
+            if config_changed:
+                from wallace_mcp import load_mcp_servers
+
+                try:
+                    load_mcp_servers(ROOT)
+                except (OSError, ValueError) as error:
+                    print(f"MCP configuration is not reloadable yet: {error}", flush=True)
+                    continue
 
             print("Source change detected; reloading Wallace.", flush=True)
-            _stop_child(child)
+            if child.poll() is None:
+                _stop_child(child)
             child = _start_child()
+            crash_reported = False
+            _wait_for_ready(child)
     except KeyboardInterrupt:
         _stop_child(child)
         return 0

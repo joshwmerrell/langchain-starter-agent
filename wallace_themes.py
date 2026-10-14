@@ -35,18 +35,63 @@ WALLACE_PRESETS: tuple[Theme, ...] = (
         foreground="#e9e3d9", background="#17181d", surface="#24242b",
     ),
     Theme(
-        name="wallace-future", primary="#52dcff", secondary="#bd7aff",
-        success="#62f3c8", warning="#ffd174", error="#ff668f",
-        foreground="#e2edff", background="#090f23", surface="#141b33",
+        name="wallace-dark", primary="#e0e0e0", secondary="#a8a8a8",
+        success="#bdbdbd", warning="#d0d0d0", error="#f0f0f0",
+        foreground="#d8d8d8", background="#000000", surface="#000000",
+        panel="#000000", accent="#c0c0c0", luminosity_spread=0.0,
+        variables={
+            "text": "#d8d8d8",
+            "text-primary": "#e0e0e0",
+            "text-secondary": "#a8a8a8",
+            "text-success": "#bdbdbd",
+            "text-warning": "#d0d0d0",
+            "text-error": "#f0f0f0",
+            "text-accent": "#c0c0c0",
+            "text-muted": "#888888",
+            "text-disabled": "#666666",
+            "button-foreground": "#d8d8d8",
+            "button-color-foreground": "#d8d8d8",
+            "button-focus-text-style": "bold underline",
+            "input-selection-background": "#555555",
+            "input-selection-foreground": "#ffffff",
+            "screen-selection-background": "#555555",
+            "screen-selection-foreground": "#ffffff",
+        },
     ),
     Theme(
-        name="wallace-night-mode", primary="#97b3ae", secondary="#b5a7ba",
+        name="wallace-vaporwave", primary="#ff4bd8", secondary="#56eaff",
+        success="#92f7a4", warning="#ffd36c", error="#ff769b",
+        foreground="#e8efff", background="#101431", surface="#1b2350",
+        panel="#232d60",
+    ),
+    Theme(
+        name="wallace-grayscale", primary="#d0d0d0", secondary="#a6a6a6",
+        success="#bcbcbc", warning="#e0e0e0", error="#eeeeee",
+        foreground="#d8d8d8", background="#0d0d0d", surface="#1c1c1c",
+        panel="#252525", accent="#b8b8b8", luminosity_spread=0.0,
+        variables={
+            "text": "#d8d8d8",
+            "text-primary": "#d0d0d0",
+            "text-secondary": "#a6a6a6",
+            "text-success": "#bcbcbc",
+            "text-warning": "#e0e0e0",
+            "text-error": "#eeeeee",
+            "text-accent": "#b8b8b8",
+            "text-muted": "#898989",
+            "input-selection-background": "#666666",
+            "input-selection-foreground": "#ffffff",
+            "screen-selection-background": "#666666",
+            "screen-selection-foreground": "#ffffff",
+        },
+    ),
+    Theme(
+        name="wallace-night", primary="#97b3ae", secondary="#b5a7ba",
         success="#a6bea6", warning="#d0b994", error="#cd9999",
         foreground="#cbd5d1", background="#11191b", surface="#1b2527",
         panel="#202c2e",
     ),
     Theme(
-        name="wallace-red-light", primary="#d00000", secondary="#a80000",
+        name="wallace-red", primary="#d00000", secondary="#a80000",
         success="#b80000", warning="#e00000", error="#ff0000",
         accent="#c00000", foreground="#d80000", background="#050000",
         surface="#180000", panel="#200000", luminosity_spread=0.0,
@@ -72,6 +117,18 @@ WALLACE_PRESETS: tuple[Theme, ...] = (
 )
 
 DEFAULT_THEME = "wallace-classic"
+# Dark mode keeps black surfaces and grayscale body text. These red shades
+# distinguish structure, the current user, warnings, and failures.
+DARK_WORKING_COLOR = "#ff6262"
+DARK_HEADING_COLOR = "#e48787"
+DARK_WARNING_COLOR = "#f2a0a0"
+DARK_ERROR_COLOR = "#ff5050"
+DARK_TEXT_ACCENTS = frozenset({
+    DARK_WORKING_COLOR,
+    DARK_HEADING_COLOR,
+    DARK_WARNING_COLOR,
+    DARK_ERROR_COLOR,
+})
 _HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}\Z")
 
 
@@ -153,8 +210,18 @@ def rich_palette(theme: Theme) -> dict[str, str]:
     if theme.name == DEFAULT_THEME:
         palette["user"] = "#93c5fd"
         palette["muted"] = "#94a3b8"
-    elif theme.name == "wallace-red-light":
+    elif theme.name == "wallace-dark":
+        palette.update({
+            "primary": DARK_HEADING_COLOR,
+            "user": DARK_WORKING_COLOR,
+            "warning": DARK_WARNING_COLOR,
+            "error": DARK_ERROR_COLOR,
+            "muted": "#888888",
+        })
+    elif theme.name == "wallace-red":
         palette["muted"] = "#890000"
+    elif theme.name == "wallace-grayscale":
+        palette["muted"] = "#898989"
     return palette
 
 
@@ -164,7 +231,11 @@ def load_theme_choice(project_root: Path) -> str:
     except (OSError, json.JSONDecodeError):
         return DEFAULT_THEME
     choice = data.get("theme") if isinstance(data, dict) else None
-    return choice if isinstance(choice, str) and choice else DEFAULT_THEME
+    aliases = {
+        "wallace-night-mode": "wallace-night",
+        "wallace-red-light": "wallace-red",
+    }
+    return aliases.get(choice, choice) if isinstance(choice, str) and choice else DEFAULT_THEME
 
 
 def save_theme_choice(project_root: Path, theme_name: str) -> None:

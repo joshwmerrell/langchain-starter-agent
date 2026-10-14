@@ -57,6 +57,7 @@ class ConversationThreadManager:
         self.project_root = project_root.resolve()
         self.root = self.project_root / ".wallace" / "conversations"
         self.index_path = self.root / "index.json"
+        self.active_path = self.root / ".active-thread.json"
         self.legacy_path = self.project_root / ".wallace" / "conversation.json"
         self.legacy_pending_path = self.project_root / ".wallace" / "pending_turn.json"
         self.root.mkdir(parents=True, exist_ok=True)
@@ -154,7 +155,10 @@ class ConversationThreadManager:
             return
         try:
             raw = self.legacy_path.read_text(encoding="utf-8")
-            if isinstance(json.loads(raw), list):
+            parsed = json.loads(raw)
+            if isinstance(parsed, list) or (
+                isinstance(parsed, dict) and isinstance(parsed.get("messages"), list)
+            ):
                 self._atomic_write(target, raw)
             if self.legacy_pending_path.exists():
                 self._atomic_write(self.pending_path("main"), self.legacy_pending_path.read_text(encoding="utf-8"))
@@ -163,6 +167,27 @@ class ConversationThreadManager:
 
     def list_threads(self) -> list[ThreadRecord]:
         return sorted(self._read_index(), key=lambda record: record.updated_at, reverse=True)
+
+    def active_thread_id(self) -> str:
+        """Return the last selected, still-existing thread, or a safe fallback."""
+        records = self.list_threads()
+        fallback = next((record.thread_id for record in records if record.thread_id == "main"), None)
+        fallback = fallback or (records[0].thread_id if records else "main")
+        try:
+            data = json.loads(self.active_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return fallback
+        selected = data.get("thread_id") if isinstance(data, dict) else None
+        return selected if isinstance(selected, str) and any(
+            record.thread_id == selected for record in records
+        ) else fallback
+
+    def select_thread(self, thread_id: str) -> None:
+        """Remember an existing thread across normal starts and hot reloads."""
+        thread_id = self.validate_id(thread_id)
+        if self._find(thread_id) is None:
+            raise ValueError(f"unknown thread: {thread_id}")
+        self._atomic_write(self.active_path, json.dumps({"thread_id": thread_id}) + "\n")
 
     def create(self, title: str | None = None, thread_id: str | None = None) -> ThreadRecord:
         records = self._read_index()
@@ -204,7 +229,14 @@ class ConversationThreadManager:
         if len(records) == 1:
             raise ValueError("cannot remove the last conversation thread")
 
-        self._write_index([record for record in records if record.thread_id != thread_id])
+        removing_active = self.active_thread_id() == thread_id
+        remaining = [record for record in records if record.thread_id != thread_id]
+        self._write_index(remaining)
+        if removing_active:
+            self.select_thread(next(
+                (record.thread_id for record in remaining if record.thread_id == "main"),
+                remaining[0].thread_id,
+            ))
         self.conversation_path(thread_id).unlink(missing_ok=True)
         self.pending_path(thread_id).unlink(missing_ok=True)
         return removed

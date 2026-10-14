@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 from fnmatch import fnmatch
 from pathlib import Path
@@ -16,6 +17,7 @@ from pathlib import Path
 from langchain.tools import tool
 
 from dependency_analysis import DependencyGraph, analyze_change_impact
+from wallace_mcp import all_mcp_servers, connection_status
 
 # Files outside this directory can never be accessed by the agent.
 SAFE_ROOT = Path(__file__).resolve().parent
@@ -42,7 +44,25 @@ MAX_REPLACEMENT_CHARS = 25_000
 COMMAND_TIMEOUT = 30
 TEST_TIMEOUT = 60
 
-ACCESS_DENIED = "Error: Access denied or file not found."
+ACCESS_DENIED = (
+    "Error: Access denied or file not found. Use a project-root-relative path "
+    "as shown by get_project_tree (for example, test_site/app.ts)."
+)
+
+
+def _tool_environment() -> dict[str, str]:
+    """Do not pass common credential variables to model-invoked subprocesses.
+
+    This reduces accidental disclosure but is not a sandbox: commands still
+    run as the user's OS account and may read accessible files.
+    """
+    blocked = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+    return {
+        name: value for name, value in os.environ.items()
+        if not name.upper().endswith(blocked)
+        and not name.upper().startswith("AWS_")
+        and name.upper() not in {"SSH_AUTH_SOCK", "GPG_AGENT_INFO"}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -122,22 +142,28 @@ def _truncate_middle(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return f"{text[:head]}\n...[{len(text) - limit} characters omitted]...\n{text[-tail:]}"
 
 
-def _run_command(args: list[str] | str, *, shell: bool = False, timeout: int = COMMAND_TIMEOUT) -> str:
+def _run_command(
+    args: list[str] | str, *, shell: bool = False,
+    timeout: int = COMMAND_TIMEOUT, cwd: Path | None = None,
+    input_text: str | None = None,
+) -> str:
     """Run a command in the project root and return formatted, bounded output.
 
-    stdin is closed so a command can never wait for (or steal) terminal input,
-    which would otherwise interfere with the Textual UI.
+    stdin is closed unless the host supplies source text to a fixed checker,
+    so commands cannot wait for (or steal) input from the Textual UI.
     """
     try:
         r = subprocess.run(
             args,
             shell=shell,
-            cwd=SAFE_ROOT,
+            cwd=cwd or SAFE_ROOT,
+            env=_tool_environment(),
             capture_output=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL if input_text is None else None,
+            input=input_text,
         )
     except subprocess.TimeoutExpired:
         return f"Error: Command timed out after {timeout} seconds."
@@ -166,6 +192,7 @@ def _run(cmd: list[str], max_chars: int = 2500) -> str:
     try:
         r = subprocess.run(
             cmd,
+            env=_tool_environment(),
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -445,6 +472,92 @@ def check_python_syntax(path: str) -> str:
 
 
 @tool
+def check_source_file(path: str) -> str:
+    """Check a source file with an installed, non-networked parser/compiler.
+
+    TypeScript uses Deno for Deno projects or standalone files, and tsc for
+    Node projects. HTML/CSS get a basic parse (not a browser behavior test).
+    External checkers must already be installed; this tool never installs packages.
+
+    Args:
+        path: Source file relative to the project root.
+    """
+    target = _resolve(path)
+    if target is None or not target.is_file():
+        return ACCESS_DENIED
+    suffix = target.suffix.lower()
+    if suffix == ".py":
+        return check_python_syntax.invoke({"path": path})
+    if suffix in {".json", ".toml"}:
+        try:
+            source = target.read_text(encoding="utf-8")
+            json.loads(source) if suffix == ".json" else tomllib.loads(source)
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            return f"Error: invalid {suffix[1:]} in {path}: {error}"
+        return f"OK: {path} has valid {suffix[1:]} syntax."
+    if suffix in {".html", ".css"}:
+        if shutil.which("deno") is None:
+            return f"Error: deno is not installed; cannot parse {path}."
+        try:
+            source = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            return f"Error reading {path}: {error}"
+        result = _run_command(
+            ["deno", "fmt", "--no-config", "--no-editorconfig", "--ext", suffix[1:], "-"],
+            timeout=TEST_TIMEOUT, input_text=source,
+        )
+        if result.startswith("Exit code: 0"):
+            return (
+                f"OK: basic {suffix[1:]} parse completed for {path}; "
+                "CSS property validity and cross-file references were not checked; "
+                "browser behavior was not checked."
+            )
+        return f"{result}\nChecker: deno fmt for {path}"
+    if suffix in {".ts", ".tsx"}:
+        node_project = any(
+            (parent / name).is_file()
+            for parent in (target.parent, *target.parents)
+            if parent == SAFE_ROOT or parent.is_relative_to(SAFE_ROOT)
+            for name in ("tsconfig.json", "package.json")
+        )
+        deno_project = any(
+            (parent / name).is_file()
+            for parent in (target.parent, *target.parents)
+            if parent == SAFE_ROOT or parent.is_relative_to(SAFE_ROOT)
+            for name in ("deno.json", "deno.jsonc")
+        )
+        if deno_project or (not node_project and shutil.which("deno") is not None):
+            command = [
+                "deno", "check", "--cached-only", "--no-lock",
+                "--node-modules-dir=none", str(target),
+            ]
+        else:
+            command = ["tsc", "--noEmit", "--pretty", "false", "--skipLibCheck"]
+            if suffix == ".tsx":
+                command.extend(["--jsx", "react-jsx"])
+            command.append(str(target))
+        if shutil.which(command[0]) is None:
+            return f"Error: {command[0]} is not installed; cannot check {path}."
+        result = _run_command(command, timeout=TEST_TIMEOUT)
+        return f"{result}\nChecker: {command[0]} for {path}"
+    commands = {
+        ".js": ["node", "--check", str(target)],
+        ".mjs": ["node", "--check", str(target)],
+        ".cjs": ["node", "--check", str(target)],
+        ".sh": ["bash", "-n", str(target)],
+        ".go": ["gofmt", "-e", "-d", str(target)],
+        ".rs": ["rustc", "--edition=2021", "--crate-type=lib", "--emit=metadata", "-o", os.devnull, str(target)],
+    }
+    command = commands.get(suffix)
+    if command is None:
+        return f"Error: unsupported source type {suffix or '(none)'}."
+    if shutil.which(command[0]) is None:
+        return f"Error: {command[0]} is not installed; cannot check {path}."
+    result = _run_command(command, timeout=TEST_TIMEOUT)
+    return f"{result}\nChecker: {command[0]} for {path}"
+
+
+@tool
 def summarize_project_file(path: str) -> str:
     """Summarize a Python project file's public API and dependency relationships.
 
@@ -492,6 +605,7 @@ def analyze_git_change_impact(staged: bool = False) -> str:
     result = subprocess.run(
         command,
         cwd=SAFE_ROOT,
+        env=_tool_environment(),
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -521,6 +635,7 @@ def analyze_git_change_impact(staged: bool = False) -> str:
         untracked = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             cwd=SAFE_ROOT,
+            env=_tool_environment(),
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -660,6 +775,29 @@ def preview_write(path: str, content: str) -> str:
 # ---------------------------------------------------------------------------
 
 @tool
+def list_mcp_connections() -> str:
+    """List MCP server URLs and live connection states, without changing them.
+
+    MCP management is user-only through the TUI's /mcp commands. Do not edit
+    the private MCP registry with shell commands.
+    """
+    try:
+        servers = all_mcp_servers(SAFE_ROOT)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        return f"Error: MCP configuration could not be read: {error}"
+    return json.dumps({"servers": [
+        {
+            "name": server.name,
+            "url": server.url,
+            "active": server.enabled,
+            "connection": connection_status(server),
+            "built_in": server.builtin,
+            "keywords": server.keywords,
+        }
+        for server in servers
+    ]})
+
+@tool
 def execute_command(command: str) -> str:
     """Run a shell command in the project root (30 second limit, no interactive input). Output is shortened if long.
 
@@ -693,6 +831,118 @@ def run_tests(test_path: str = ".") -> str:
     return _run_command(command, timeout=TEST_TIMEOUT)
 
 
+@tool
+def run_language_tests(language: str, path: str = ".") -> str:
+    """Run a project's Python, JavaScript/TypeScript, Go, or Rust tests.
+
+    Uses pytest/unittest, Deno or npm test, go test, or cargo test.
+    Standalone Deno test files also work without a manifest. The relevant
+    runner must already be installed. Tests may execute project code, so
+    approval is required.
+
+    Args:
+        language: One of python, javascript, typescript, go, rust.
+        path: Project or test directory relative to the Wallace workspace.
+    """
+    target = _resolve(path)
+    if target is None or not target.exists():
+        return ACCESS_DENIED
+    language = language.strip().lower()
+    if language == "python":
+        return run_tests.invoke({"test_path": path})
+    if not target.is_dir():
+        return "Error: non-Python test path must be a project directory."
+    if language in {"javascript", "typescript"}:
+        deno_manifest = next(
+            (target / name for name in ("deno.json", "deno.jsonc") if (target / name).is_file()),
+            None,
+        )
+        if deno_manifest is not None:
+            manifest = deno_manifest
+            runner = "deno"
+            command = ["deno", "test", "--cached-only", "--no-lock", "--node-modules-dir=none"]
+        elif (target / "package.json").is_file():
+            manifest = target / "package.json"
+            runner = "npm"
+            command = [runner, "test"]
+        elif any(next(target.glob(pattern), None) is not None for pattern in (
+            "*_test.ts", "*.test.ts", "*_test.tsx", "*.test.tsx",
+            "*_test.js", "*.test.js", "*_test.mjs", "*.test.mjs",
+        )):
+            manifest = None
+            runner = "deno"
+            command = [
+                "deno", "test", "--cached-only", "--no-config", "--no-lock",
+                "--node-modules-dir=none",
+            ]
+        else:
+            return f"Error: no test manifest or standalone Deno tests found in {path}."
+    elif language == "go":
+        manifest = target / "go.mod"
+        runner = "go"
+        command = [runner, "test", "./..."]
+    elif language == "rust":
+        manifest = target / "Cargo.toml"
+        runner = "cargo"
+        command = [runner, "test", "--manifest-path", str(manifest)]
+    else:
+        return f"Error: unsupported test language {language!r}."
+    if manifest is not None and (not manifest.is_file() or not _is_allowed(manifest.resolve())):
+        return f"Error: {manifest.name} is missing from {path}."
+    if shutil.which(runner) is None:
+        return f"Error: {runner} is not installed; cannot test {path}."
+    return _run_command(command, timeout=TEST_TIMEOUT, cwd=target)
+
+
+@tool
+def verify_tool_contract(tool_name: str, test_path: str) -> str:
+    """Verify a local tool is registered and has a passing contract-test file.
+
+    This checks a separate Python process, so a tool added during the current
+    turn can be verified before the TUI reloads. The test file must contain a
+    call to the tool's invoke method; passing unrelated tests is insufficient.
+
+    Args:
+        tool_name: Exact name of a @tool registered in tools.TOOLS.
+        test_path: Python test file relative to the workspace root.
+    """
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", tool_name):
+        return "Error: invalid tool name."
+    target = _resolve(test_path)
+    if target is None or not target.is_file() or target.suffix != ".py":
+        return ACCESS_DENIED
+    try:
+        tree = ast.parse(target.read_text(encoding="utf-8"), filename=test_path)
+    except (OSError, UnicodeDecodeError, SyntaxError) as error:
+        return f"Error: could not inspect test file: {error}"
+    exercised = any(
+        isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and function.name.startswith("test_")
+        and any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "invoke"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == tool_name
+            for node in ast.walk(function)
+        )
+        for function in ast.walk(tree)
+    )
+    if not exercised:
+        return f"Error: a test_ function in {test_path} must call {tool_name}.invoke(...)."
+    registry = _run_command([
+        sys.executable, "-c",
+        "import sys; from tools import TOOLS; sys.exit(0 if sys.argv[1] in {tool.name for tool in TOOLS} else 1)",
+        tool_name,
+    ])
+    if not registry.startswith("Exit code: 0"):
+        return f"Error: {tool_name} is not registered in tools.TOOLS, or the tools module cannot be imported. {registry}"
+    result = run_tests.invoke({"test_path": test_path})
+    if not result.startswith("Exit code: 0"):
+        return f"Error: contract tests failed for {tool_name}. {result}"
+    return f"OK: {tool_name} is registered; {test_path} contains a test invocation and its tests pass."
+
+
 def _module_available(name: str) -> bool:
     """Return whether a Python module can be imported by this interpreter."""
     result = subprocess.run(
@@ -706,6 +956,7 @@ def _module_available(name: str) -> bool:
             name,
         ],
         cwd=SAFE_ROOT,
+        env=_tool_environment(),
         capture_output=True,
         stdin=subprocess.DEVNULL,
         timeout=5,
@@ -751,6 +1002,7 @@ TOOLS = [
     search_in_files,
     get_code_symbols,
     check_python_syntax,
+    check_source_file,
     summarize_project_file,
     analyze_project_dependencies,
     analyze_git_change_impact,
@@ -758,15 +1010,23 @@ TOOLS = [
     replace_in_file,
     execute_command,
     run_tests,
+    run_language_tests,
+    verify_tool_contract,
     get_git_status,
     get_git_diff,
     get_system_info,
+    list_mcp_connections,
 ]
 
-# The agent pauses for the user's approval before these run.
+# Explicitly reviewed read-only tools may run without approval. A new local
+# tool is approval-gated automatically until it is deliberately added here.
+READ_ONLY_TOOLS = {
+    "get_project_tree", "read_safe_file", "search_in_files",
+    "get_code_symbols", "check_python_syntax", "summarize_project_file",
+    "analyze_project_dependencies", "analyze_git_change_impact",
+    "get_git_status", "get_git_diff", "get_system_info",
+    "list_mcp_connections",
+}
 TOOLS_REQUIRING_APPROVAL = {
-    "write_safe_file",
-    "replace_in_file",
-    "execute_command",
-    "run_tests",
+    tool.name for tool in TOOLS if tool.name not in READ_ONLY_TOOLS
 }

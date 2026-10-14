@@ -1,13 +1,14 @@
 [project]
 name = "langchain-starter-agent"
 version = "0.1.0"
-description = "An unfinished local-first AI agent for personal assistance and coding, with an Ollama-backed CLI and TUI"
+description = "An unfinished local-first AI agent for personal assistance and coding, with optional cloud models"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "dotenv>=0.9.9",
     "langchain[mcp]>=1.4.2",
     "langchain-google-genai>=4.4.0",
+    "langchain-openai>=1.6.7",
     "rich>=15.0.0",
     "uuid>=1.30",
     "deepagents>=0.7.21",

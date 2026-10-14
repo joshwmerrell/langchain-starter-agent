@@ -165,7 +165,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("write_safe_file", saved.last_error)
                         self.assertNotIn("SECRET", saved.last_error)
 
-    async def test_tui_continuation_does_not_inject_prior_assistant_claim(self):
+    async def test_tui_plan_context_does_not_treat_prior_claim_as_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             captured = []
@@ -189,6 +189,58 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIn("Original request: Implement main.py", captured[0])
                             self.assertNotIn("step_id", captured[0])
                             self.assertNotIn("/workspace", captured[0])
+
+    async def test_tui_replaces_unverified_completion_claim_with_host_handoff(self):
+        class StreamAgent:
+            def __init__(self):
+                self.messages = []
+
+            async def astream(self, payload, config, stream_mode):
+                call = AIMessage(content="", tool_calls=[{
+                    "id": "edit-site", "name": "write_safe_file",
+                    "args": {"path": "site/app.ts", "content": "const answer = 42;"},
+                }])
+                result = ToolMessage(
+                    content="Created site/app.ts", tool_call_id="edit-site", name="write_safe_file",
+                )
+                answer = AIMessage(content="The site was compiled and works perfectly.")
+                self.messages = [HumanMessage(content="Build the site"), call, result, answer]
+                yield {"tools": {"messages": [result]}}
+                yield {"agent": {"messages": [answer]}}
+
+            async def aget_state(self, config):
+                return SimpleNamespace(values={"messages": self.messages})
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tui_agent.SAFE_ROOT", root):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        app.agent = StreamAgent()
+                        app.thread_config = {}
+                        plan = parse_request(root, "Build the site", session_id=app.thread_id)
+                        app._active_plan = plan
+                        await app.run_turn("Build the site", user_prompt="Build the site").wait()
+                        saved = app.conversation_store.load_all()
+                        self.assertIn("has not verified", saved[-1]["content"])
+                        self.assertNotIn("works perfectly", saved[-1]["content"])
+                        self.assertEqual(load_plan(root, plan.session_id, plan.plan_id).status, "active")
+
+    async def test_tui_marks_nonzero_command_exit_as_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        app._shown_tool_calls = set()
+                        app._shown_tool_results = set()
+                        app._show_progress(ToolMessage(
+                            content="Exit code: 1\nSTDERR:\nSyntaxError",
+                            tool_call_id="check", name="execute_command",
+                        ))
+                        rendered = [getattr(entry[0], "plain", "") for entry in app.chat_log._theme_entries]
+                        self.assertTrue(any("✗ execute_command failed" in line for line in rendered))
 
     async def test_tui_repetitive_answer_is_not_saved_as_completion(self):
         repeated = ("I will review the files before editing them.\n</think>\n\n" * 20)

@@ -150,10 +150,20 @@ def render_plan_markdown(plan: PlanSpec) -> str:
     if plan.tool_history:
         lines.extend(
             f"- `{item['name']}` {item['target']}: {item['outcome']}"
+            + (f" ({item['diagnostic']})" if item.get("diagnostic") else "")
             for item in plan.tool_history[-12:]
         )
     else:
         lines.append("- None recorded.")
+    if plan.unchecked_targets():
+        lines.extend(["", "## Files needing validation", ""])
+        lines.extend(f"- `{target}`" for target in plan.unchecked_targets())
+    if plan.unresolved_failures:
+        lines.extend(["", "## Unresolved failed checks or edits", ""])
+        lines.extend(
+            f"- `{item['name']}` {item['target']}: {item.get('diagnostic') or item['outcome']}"
+            for item in plan.unresolved_failures
+        )
     lines.extend(["", "## Summary", "", plan.summary or "Pending completion.", ""])
     if plan.last_error:
         lines.extend(["## Last error", "", plan.last_error, ""])

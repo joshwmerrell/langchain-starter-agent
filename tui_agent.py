@@ -5,6 +5,8 @@ Keys:      Enter = send, Esc = cancel current request, Ctrl+L = clear log, Ctrl+
            Select chat text with the mouse and press Ctrl+C; Input supports Ctrl+C/Ctrl+V.
 Threads:   /threads, /new [title], /switch <id or title>, /rename <title>, /remove <id or title>, /clear
 Themes:    F9 or /theme to choose; /theme <name> to apply directly
+Models:    F10 or /model to list; /model <name> to switch; /key opens masked entry
+MCP:       F11 or /mcp to list; /mcp add|remove|on|off|reload to manage
 Approvals: y = approve, n / Esc = reject (when the agent wants to run a command or change a file)
 """
 
@@ -15,6 +17,7 @@ import shlex
 import tempfile
 from datetime import datetime
 from fnmatch import fnmatch
+from functools import partial
 from pathlib import Path
 
 from rich.markdown import Markdown
@@ -39,15 +42,23 @@ from textual.widgets import (
 )
 
 from main import (
+    CLOUD_KEY_WARNING,
+    CLOUD_TOOL_WARNING,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
     assistant_response_text,
+    clean_response_retry_prompt,
     ConversationStore,
     EMPTY_RESPONSE_RETRY_PROMPT,
     describe_error,
     extract_action_requests,
     format_action_request,
     is_malformed_tool_call_error,
+    local_datetime_response,
+    list_models_for_provider,
     malformed_retry_payload,
     make_decision,
+    memory_budget_for,
     model_tool_activity,
     new_thread_config,
     no_text_status,
@@ -55,8 +66,31 @@ from main import (
     response_quality_error,
     resume_command,
     setup_agent,
+    summarize_thread_memory,
+    with_thread_memory,
+    verified_plan_response,
+    tool_result_failed,
 )
 from tools import SAFE_ROOT, SENSITIVE_PATTERNS, SKIP_DIRS
+from wallace_mcp import (
+    all_mcp_servers,
+    apply_mcp_command,
+    connection_status,
+    parse_mcp_command,
+    read_mcp_configuration,
+    restore_connection_statuses,
+    save_mcp_configuration,
+    snapshot_connection_statuses,
+)
+from wallace_models import (
+    CloudCredentials,
+    MissingCredentialError,
+    load_model_choice,
+    list_installed_models,
+    parse_model_selection,
+    save_model_choice,
+    use_environment_key,
+)
 from wallace_planning import (
     ArchiveManager,
     ConversationThreadManager,
@@ -64,7 +98,11 @@ from wallace_planning import (
     resume_or_create,
     save_plan,
 )
+from wallace_sky import sky_icons
 from wallace_themes import (
+    DARK_HEADING_COLOR,
+    DARK_TEXT_ACCENTS,
+    DARK_WORKING_COLOR,
     DEFAULT_THEME,
     WALLACE_PRESETS,
     discover_omarchy_themes,
@@ -118,6 +156,37 @@ def _overlay_strip_style(strip: Strip, style: Style) -> Strip:
     )
 
 
+def _grayscale_strip(
+    strip: Strip,
+    *,
+    black_background: bool = False,
+    preserve_foreground: frozenset[str] = frozenset(),
+) -> Strip:
+    """Remove syntax hues while retaining intentional theme text accents."""
+    def gray(color, *, foreground: bool) -> str | None:
+        if color is None:
+            return None
+        triplet = color.get_truecolor()
+        if triplet is None:
+            return None
+        original = f"#{triplet.red:02x}{triplet.green:02x}{triplet.blue:02x}"
+        if foreground and original in preserve_foreground:
+            return original
+        level = round(0.2126 * triplet.red + 0.7152 * triplet.green + 0.0722 * triplet.blue)
+        level = max(176, level) if foreground else (0 if black_background else min(51, level))
+        return f"#{level:02x}{level:02x}{level:02x}"
+
+    segments = []
+    for segment in strip:
+        style = segment.style or Style()
+        foreground = gray(style.color, foreground=True)
+        background = gray(style.bgcolor, foreground=False)
+        if foreground is not None or background is not None:
+            style = style + Style(color=foreground, bgcolor=background)
+        segments.append(Segment(segment.text, style, segment.control))
+    return Strip(segments, strip.cell_length)
+
+
 def _short(value: object, limit: int = 80) -> str:
     text = str(value).replace("\n", " ")
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -129,7 +198,24 @@ def _format_tool_call(call: dict) -> str:
 
 
 class HistoryInput(Input):
-    """Input widget with per-thread Up/Down command history."""
+    """Single-line editor with per-thread Up/Down command history."""
+
+    BINDINGS = [
+        Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding(
+            "ctrl+backspace,alt+backspace",
+            "delete_left_word",
+            "Delete previous word",
+            show=False,
+        ),
+        Binding("ctrl+delete", "delete_right_word", "Delete next word", show=False),
+        Binding("ctrl+home", "home", "Move to start", show=False),
+        Binding("ctrl+end", "end", "Move to end", show=False),
+        Binding("ctrl+shift+home", "home(True)", "Select to start", show=False),
+        Binding("ctrl+shift+end", "end(True)", "Select to end", show=False),
+        Binding("ctrl+z", "undo_edit", "Undo", show=False),
+        Binding("ctrl+y,ctrl+shift+z", "redo_edit", "Redo", show=False),
+    ]
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -138,8 +224,47 @@ class HistoryInput(Input):
         self._history_draft = ""
         self._setting_history_value = False
         self._history_event_value: str | None = None
+        self._undo_stack: list[tuple[str, tuple[int, int]]] = []
+        self._redo_stack: list[tuple[str, tuple[int, int]]] = []
+        self._restoring_edit = False
+
+    def reset_edit_history(self) -> None:
+        """Keep undo/redo within the current unsent input, not another thread."""
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+
+    def _edit_state(self) -> tuple[str, tuple[int, int]]:
+        return self.value, (self.selection.start, self.selection.end)
+
+    def replace(self, text: str, start: int, end: int) -> None:
+        before = self._edit_state()
+        super().replace(text, start, end)
+        if not self._restoring_edit and self.value != before[0]:
+            self._undo_stack.append(before)
+            self._undo_stack = self._undo_stack[-100:]
+            self._redo_stack.clear()
+
+    def _restore_edit(self, state: tuple[str, tuple[int, int]]) -> None:
+        self._restoring_edit = True
+        try:
+            value, (start, end) = state
+            self.value = value
+            self.selection = type(self.selection)(start, end)
+        finally:
+            self._restoring_edit = False
+
+    def action_undo_edit(self) -> None:
+        if self._undo_stack:
+            self._redo_stack.append(self._edit_state())
+            self._restore_edit(self._undo_stack.pop())
+
+    def action_redo_edit(self) -> None:
+        if self._redo_stack:
+            self._undo_stack.append(self._edit_state())
+            self._restore_edit(self._redo_stack.pop())
 
     def load_history(self, values: list[str]) -> None:
+        self.reset_edit_history()
         self._input_history = []
         for value in values:
             self.remember_input(value)
@@ -162,6 +287,7 @@ class HistoryInput(Input):
         # Textual may deliver Input.Changed after this method returns. Keep the
         # selected value identifiable until that event is handled, otherwise
         # on_input_changed would reset navigation after every arrow press.
+        self.reset_edit_history()
         self._history_event_value = value
         self._setting_history_value = True
         try:
@@ -371,7 +497,7 @@ class ThreadPanel(Vertical):
         for record in records:
             marker = "● " if record.thread_id == current_id else "  "
             style = (
-                f"bold {WALLACE_THEME['success']}"
+                f"bold {DARK_WORKING_COLOR if self.app.theme == 'wallace-dark' else WALLACE_THEME['success']}"
                 if record.thread_id == current_id
                 else ""
             )
@@ -464,10 +590,18 @@ class SelectableRichLog(RichLog):
             self.scrollable_content_region.width,
         )
         strip = line.apply_style(self.rich_style)
-        if self.app.theme == "wallace-red-light":
+        if self.app.theme == "wallace-red":
             # Rich Markdown and syntax highlighting can supply their own blue
             # or green colors; keep even that content monochrome in red light.
             strip = _overlay_strip_style(strip, RED_LIGHT_STYLE)
+        elif self.app.theme in {"wallace-dark", "wallace-grayscale"}:
+            strip = _grayscale_strip(
+                strip,
+                black_background=self.app.theme == "wallace-dark",
+                preserve_foreground=(
+                    DARK_TEXT_ACCENTS if self.app.theme == "wallace-dark" else frozenset()
+                ),
+            )
         selection = self.text_selection
         if selection is not None:
             span = selection.get_span(absolute_y)
@@ -561,6 +695,68 @@ class ApprovalScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class CloudKeyScreen(ModalScreen[str | None]):
+    """Accept a key without putting it in the chat input or command history."""
+
+    DEFAULT_CSS = """
+    CloudKeyScreen { align: center middle; }
+    #cloud_key_dialog {
+        width: 70%;
+        max-width: 76;
+        height: auto;
+        border: thick $primary;
+        background: $surface;
+        padding: 1 2;
+    }
+    #cloud_key_title { text-style: bold; margin-bottom: 1; }
+    #cloud_key_hint { height: auto; color: $text-muted; margin-bottom: 1; }
+    #cloud_key_input { width: 1fr; margin-bottom: 1; }
+    #cloud_key_buttons { height: auto; align-horizontal: right; }
+    #cloud_key_buttons Button { margin-left: 2; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, provider: str) -> None:
+        super().__init__()
+        self.provider = provider
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="cloud_key_dialog"):
+            yield Static(f"Enter {self.provider} API key", id="cloud_key_title")
+            yield Static(
+                "Hidden input. This entry applies to the running session; Esc cancels.",
+                id="cloud_key_hint",
+            )
+            yield Input(password=True, placeholder="API key", id="cloud_key_input")
+            with Horizontal(id="cloud_key_buttons"):
+                yield Button("Cancel", id="cancel")
+                yield Button("Use key", variant="primary", id="submit")
+
+    def on_mount(self) -> None:
+        self.query_one("#cloud_key_input", Input).focus()
+
+    def _submit(self) -> None:
+        field = self.query_one("#cloud_key_input", Input)
+        key = field.value
+        field.value = ""
+        self.dismiss(key or None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._submit()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "submit":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AgentTUI(App):
     TITLE = "Wallace"
     # Keep arbitrary text selection enabled so RichLog text can be selected
@@ -615,6 +811,11 @@ class AgentTUI(App):
         text-style: bold;
         color: $primary;
     }}
+    App.-theme-wallace-dark #thread_title,
+    App.-theme-wallace-dark #workspace_title,
+    App.-theme-wallace-dark #workspace_activity_title {{
+        color: {DARK_HEADING_COLOR};
+    }}
     #workspace_tree_scroll {{
         height: 1fr;
         scrollbar-size: 1 1;
@@ -642,12 +843,33 @@ class AgentTUI(App):
         color: $primary;
         content-align: left middle;
     }}
+    App.-theme-wallace-dark #thinking {{
+        color: {DARK_WORKING_COLOR};
+    }}
     #prompt {{
         margin: 0 1 1 1;
         border: round $primary;
         &:focus {{
             border: round $secondary;
         }}
+        & > .input--selection {{
+            background: $primary;
+            color: $background;
+        }}
+    }}
+    App.-theme-wallace-dark #prompt {{
+        color: {DARK_WORKING_COLOR};
+    }}
+    App.-theme-wallace-dark Button {{
+        background: #000000;
+        color: $text;
+        border: solid $secondary;
+    }}
+    App.-theme-wallace-dark Button:hover,
+    App.-theme-wallace-dark Button:focus {{
+        background: #000000;
+        color: $text;
+        border: solid $primary;
     }}
     """
 
@@ -659,6 +881,8 @@ class AgentTUI(App):
         Binding("f7", "narrow_workspace", "Narrow workspace", show=False),
         Binding("f8", "widen_workspace", "Widen workspace", show=False),
         ("f9", "change_theme", "Themes"),
+        ("f10", "show_models", "Models"),
+        ("f11", "show_mcp", "MCP"),
         Binding("escape", "cancel", "Cancel request", show=False),
     ]
 
@@ -671,12 +895,15 @@ class AgentTUI(App):
         self.theme = saved_theme if self.get_theme(saved_theme) else DEFAULT_THEME
         self._last_persisted_theme = self.theme
         WALLACE_THEME.update(rich_palette(self.current_theme))
+        self.model_name = load_model_choice(SAFE_ROOT, OLLAMA_MODEL)
+        self.credentials = CloudCredentials()
         self.agent = None
         self.thread_config = None
         self.workspace_panel = None
         self._workspace_width = 30
         self.thread_manager = ConversationThreadManager(SAFE_ROOT)
-        self.thread_id = self.thread_manager.ensure("main").thread_id
+        self.thread_manager.ensure("main")
+        self.thread_id = self.thread_manager.active_thread_id()
         self.conversation_store = self.thread_manager.store(self.thread_id)
         self._conversation_history: list[dict[str, str]] = []
         self._active_plan = None
@@ -688,6 +915,7 @@ class AgentTUI(App):
         WALLACE_THEME.update(rich_palette(theme))
         if not getattr(self, "_theme_ready", False):
             return
+        self._update_header_datetime()
         self.chat_log.retheme()
         self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
         self.workspace_panel.refresh_view()
@@ -713,7 +941,7 @@ class AgentTUI(App):
 
     def on_mount(self) -> None:
         ArchiveManager(SAFE_ROOT).run_at_session_boundary()
-        self.chat_log = self.query_one("#chat_log", RichLog)
+        self.chat_log = self.query_one("#chat_log", SelectableRichLog)
         self.prompt_input = self.query_one("#prompt", HistoryInput)
         self.thinking_panel = self.query_one("#thinking", Static)
         self.workspace_panel = self.query_one("#workspace_panel", WorkspacePanel)
@@ -752,28 +980,45 @@ class AgentTUI(App):
         _write_reload_status("busy")
         self._rotate_thinking_status = False
         self.set_interval(0.35, self._advance_thinking_status)
-        self.chat_log.write(Text("Welcome to Wallace.", style=f"bold {WALLACE_THEME['success']}"))
-        self.chat_log.write(
-            f"Thread: {self.thread_id}. /threads /new /switch /rename /remove /clear /theme"
+        self._write_chat_block(Text("Welcome to Wallace.", style=f"bold {WALLACE_THEME['success']}"))
+        self._write_chat_block(
+            f"Thread: {self.thread_id}. /threads /new /switch /rename /remove /clear /theme /model /mcp"
         )
         self._restore_conversation()
         if pending_prompt:
-            self.chat_log.write(
+            self._write_chat_block(
                 Text(
                     "The previous request was interrupted before completion. "
                     "Ask Wallace to continue it when ready.",
                     style=WALLACE_THEME["warning"],
                 )
             )
-        self.chat_log.write(
+        self._write_chat_block(
             Text("Initializing Wallace...", style=WALLACE_THEME["warning"])
         )
         self.initialize_agent()
 
+    def _write_chat_block(self, content: object) -> None:
+        """Separate conversation turns and startup notices by one blank row."""
+        if self.chat_log._theme_entries:
+            self.chat_log.write("")
+        self.chat_log.write(content)
+
+    def _user_chat_line(self, content: str) -> Text:
+        line = Text()
+        line.append("User: ", style=f"bold {WALLACE_THEME['user']}")
+        if self.theme == "wallace-dark":
+            line.append(content, style=WALLACE_THEME["user"])
+        else:
+            line.append(content)
+        return line
+
     def _restore_conversation(self) -> None:
         if not self._conversation_history:
             return
-        self.chat_log.write(
+        previous_assistant = None
+        current_request = ""
+        self._write_chat_block(
             Text(
                 f"Restored {sum(message['role'] == 'assistant' for message in self._conversation_history)} previous turn(s).",
                 style=WALLACE_THEME["success"],
@@ -781,44 +1026,72 @@ class AgentTUI(App):
         )
         for message in self._conversation_history:
             if message["role"] == "user":
-                line = Text()
-                line.append("\nUser: ", style=f"bold {WALLACE_THEME['user']}")
-                line.append(message["content"])
-                self.chat_log.write(line)
+                current_request = message["content"]
+                self._write_chat_block(self._user_chat_line(message["content"]))
             else:
-                self.chat_log.write(
+                self._write_chat_block(
                     Text("AI:", style=f"bold {WALLACE_THEME['assistant']}")
                 )
-                if response_quality_error(message["content"]):
+                if response_quality_error(
+                    message["content"],
+                    previous_assistant=previous_assistant,
+                    current_request=current_request,
+                ):
                     self.chat_log.write(Text(
-                        "Previous AI reply omitted from display: repetitive model "
+                        "Previous AI reply omitted from display: unusable model "
                         "output. The saved conversation is unchanged.",
                         style=WALLACE_THEME["warning"],
                     ))
                 else:
                     self.chat_log.write(Markdown(message["content"]))
+                previous_assistant = message["content"]
 
     # ---------- setup ----------
 
     @work(exclusive=True, group="setup")
     async def initialize_agent(self) -> None:
         try:
-            self.agent, self.thread_config = await setup_agent(on_status=self._write_warning)
-        except Exception as error:
-            self.chat_log.write(
-                Text(f"Failed to start agent: {error}", style=WALLACE_THEME["error"])
+            provider, _ = parse_model_selection(self.model_name)
+            if provider != "ollama" and not await self._ensure_cloud_key(provider):
+                self._set_busy(False)
+                self.prompt_input.placeholder = "Cloud key needed. Use /key or /model to continue."
+                return
+            self.agent, self.thread_config = await setup_agent(
+                on_status=self._write_warning,
+                model_name=self.model_name,
+                credentials=self.credentials,
             )
+        except Exception as error:
+            self._write_warning(f"Failed to start agent: {error}")
             # A failed setup must not leave dev_tui.py waiting forever for an
             # agent that will never become idle.
             self._set_busy(False)
-            self.prompt_input.disabled = True
-            self.prompt_input.placeholder = "Wallace unavailable. Press Ctrl+Q to quit."
+            self.prompt_input.placeholder = "Agent unavailable. Use /model to select another model."
             return
 
-        self.chat_log.write(
-            Text("Wallace is ready.", style=f"bold {WALLACE_THEME['success']}")
+        self._write_chat_block(
+            Text(f"Wallace is ready. Model: {self.model_name}", style=f"bold {WALLACE_THEME['success']}")
         )
         self._set_busy(False)
+
+    async def _prompt_cloud_key(self, provider: str) -> bool:
+        self._write_warning(CLOUD_KEY_WARNING)
+        key = await self.push_screen_wait(CloudKeyScreen(provider))
+        if key is None:
+            return False
+        try:
+            self.credentials.set(provider, key)
+        except ValueError as error:
+            self._write_warning(str(error))
+            return False
+        return True
+
+    async def _ensure_cloud_key(self, provider: str) -> bool:
+        if self.credentials.get(provider) is not None:
+            return True
+        if use_environment_key(self.credentials, provider):
+            return True
+        return await self._prompt_cloud_key(provider)
 
     # ---------- input handling ----------
 
@@ -847,7 +1120,7 @@ class AgentTUI(App):
         self.thinking_panel.update(
             Text(
                 f"WALLACE  /  {self._thinking_spinners[self._thinking_spinner_index]}  {message}",
-                style=f"bold {WALLACE_THEME['primary']}",
+                style=f"bold {DARK_WORKING_COLOR if self.theme == 'wallace-dark' else WALLACE_THEME['primary']}",
             )
         )
 
@@ -863,9 +1136,185 @@ class AgentTUI(App):
             ) % len(self._thinking_messages)
         self._set_thinking_status(rotate=True)
 
+    def action_show_models(self) -> None:
+        """Show models available through the configured providers."""
+        if not self._busy:
+            self._set_busy(True)
+            self.show_models()
+
+    def action_show_mcp(self) -> None:
+        """Show saved endpoint choices and observed live connection state."""
+        try:
+            servers = all_mcp_servers(SAFE_ROOT)
+        except (OSError, ValueError) as error:
+            self._write_warning(f"Could not list MCP servers: {error}")
+            return
+        self.chat_log.write(Text("MCP servers:", style=WALLACE_THEME["primary"]))
+        for server in servers:
+            kind = "built-in, cannot remove" if server.builtin else "user-added"
+            active = "active" if server.enabled else "inactive"
+            self.chat_log.write(
+                f"  {server.name} [{kind}] — {active}, {connection_status(server)}\n"
+                f"    {server.url}"
+            )
+        self.chat_log.write(
+            "Use /mcp add <name> <URL> [keywords...], /mcp on|off|remove <name>, "
+            "or /mcp reload. 'Connected' means the last discovery succeeded; "
+            "active choices are saved across restarts."
+        )
+
+    @work(exclusive=True, group="mcp")
+    async def change_mcp(self, operation: str, name: str = "", url: str = "", keywords: tuple[str, ...] = ()) -> None:
+        """Apply a user command and rebuild the live agent without losing its thread."""
+        self._set_busy(True)
+        self._set_thinking_status(rotate=False, message="Updating MCP connections")
+        previous_config: dict | None = None
+        previous_status = snapshot_connection_statuses()
+        changed = False
+        try:
+            previous_config = read_mcp_configuration(SAFE_ROOT)
+            changed = apply_mcp_command(
+                SAFE_ROOT, operation, name, url, keywords, live_applied=True
+            )
+            if not changed and operation != "reload":
+                self.chat_log.write(f"MCP server {name} is already {operation}.")
+                return
+            if self.agent is not None:
+                replacement_agent, replacement_config = await setup_agent(
+                    on_status=self._write_warning,
+                    model_name=self.model_name,
+                    credentials=self.credentials,
+                )
+                self.agent, self.thread_config = replacement_agent, replacement_config
+            description = (
+                "MCP connections refreshed."
+                if operation == "reload" else f"MCP {operation} {name} saved."
+            )
+            if self.agent is None:
+                description += " Connections will load when Wallace starts."
+            self.chat_log.write(Text(description, style=WALLACE_THEME["success"]))
+            self.action_show_mcp()
+        except Exception as error:
+            if changed and previous_config is not None:
+                try:
+                    save_mcp_configuration(SAFE_ROOT, previous_config, live_applied=True)
+                except (OSError, ValueError) as rollback_error:
+                    self._write_warning(f"MCP rollback failed: {rollback_error}")
+            restore_connection_statuses(previous_status)
+            self._write_warning(f"Could not update MCP servers: {self.credentials.redact(str(error))}")
+        finally:
+            self._set_busy(False)
+
+    @work(exclusive=True, group="model")
+    async def show_models(self, provider: str | None = None) -> None:
+        self._set_busy(True)
+        self._set_thinking_status(rotate=False, message="Checking available models")
+        try:
+            self.chat_log.write(Text(f"Current model: {self.model_name}", style=WALLACE_THEME["primary"]))
+            providers = (provider,) if provider else ("ollama", "openai", "gemini")
+            for source in providers:
+                try:
+                    models = await list_models_for_provider(source, self.credentials)
+                    self.chat_log.write(f"{source.title()} models:")
+                    if not models:
+                        self.chat_log.write("  No models returned.")
+                    for name in models:
+                        full_name = name if source == "ollama" else f"{source}:{name}"
+                        marker = "*" if full_name == self.model_name else " "
+                        self.chat_log.write(f"{marker} {full_name}")
+                except MissingCredentialError:
+                    variable = "OPENAI_API_KEY" if source == "openai" else "GOOGLE_API_KEY"
+                    self._write_warning(f"{source.title()}: set {variable} in .env or the environment to list account models.")
+                except Exception as error:
+                    self._write_warning(f"Could not list {source} models: {error}")
+        finally:
+            self.chat_log.write(
+                "Use /models [ollama|openai|gemini] to filter; /model <name> to switch. "
+                "Cloud lists may include models Wallace cannot use for chat/tools."
+            )
+            self._set_busy(False)
+
+    @work(exclusive=True, group="model")
+    async def change_model(self, requested: str) -> None:
+        """Switch the live agent and persist only after a successful rebuild."""
+        self._set_busy(True)
+        self._set_thinking_status(rotate=False, message="Switching model")
+        previous_provider, _ = parse_model_selection(self.model_name)
+        previous_key = self.credentials.get(previous_provider)
+        try:
+            if requested == self.model_name and self.agent is not None:
+                self.chat_log.write(f"Already using model: {requested}")
+                return
+            provider, _ = parse_model_selection(requested)
+            if provider == "ollama":
+                models = await list_installed_models(OLLAMA_BASE_URL)
+                if requested not in models:
+                    self._write_warning(
+                        f"Model {requested!r} is not installed. Use /model to list available models."
+                    )
+                    return
+            elif self.credentials.get(provider) is None:
+                if not await self._ensure_cloud_key(provider):
+                    return
+            replacement_agent, replacement_config = await setup_agent(
+                on_status=self._write_warning,
+                model_name=requested,
+                credentials=self.credentials,
+            )
+            save_model_choice(SAFE_ROOT, requested)
+            self.agent, self.thread_config = replacement_agent, replacement_config
+            self.model_name = requested
+            if provider == "ollama":
+                self.credentials.clear()
+            self.chat_log.write(Text(
+                f"Now using model: {requested}. Conversation history is preserved.",
+                style=WALLACE_THEME["success"],
+            ))
+        except Exception as error:
+            detail = self.credentials.redact(str(error))
+            if previous_key is not None:
+                detail = detail.replace(previous_key.get_secret_value(), "[REDACTED API KEY]")
+                self.credentials.set(previous_provider, previous_key.get_secret_value())
+            else:
+                self.credentials.clear()
+            self._write_warning(f"Could not switch model: {detail}")
+        finally:
+            self._set_busy(False)
+
+    @work(exclusive=True, group="model")
+    async def change_cloud_key(self) -> None:
+        provider, _ = parse_model_selection(self.model_name)
+        if provider == "ollama":
+            self._write_warning("Select an openai:<model> or gemini:<model> first.")
+            self._set_busy(False)
+            return
+        previous_key = self.credentials.get(provider)
+        self._set_busy(True)
+        try:
+            if not await self._prompt_cloud_key(provider):
+                return
+            replacement_agent, replacement_config = await setup_agent(
+                on_status=self._write_warning,
+                model_name=self.model_name,
+                credentials=self.credentials,
+            )
+            self.agent, self.thread_config = replacement_agent, replacement_config
+            self.chat_log.write(Text("Cloud key updated for this session.", style=WALLACE_THEME["success"]))
+        except Exception as error:
+            detail = self.credentials.redact(str(error))
+            if previous_key is not None:
+                detail = detail.replace(previous_key.get_secret_value(), "[REDACTED API KEY]")
+                self.credentials.set(provider, previous_key.get_secret_value())
+            else:
+                self.credentials.clear()
+            self._write_warning(f"Could not update cloud key: {detail}")
+        finally:
+            self._set_busy(False)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         self.prompt_input.value = ""
+        self.prompt_input.reset_edit_history()
 
         if not prompt:
             return
@@ -876,19 +1325,21 @@ class AgentTUI(App):
             self._handle_thread_command(prompt)
             return
         if self.agent is None:
+            self.prompt_input.value = prompt
+            self._write_warning("Wallace is unavailable. Use /model or /key to continue.")
             return
 
-        self.conversation_store.save_pending(prompt)
-        self._conversation_history = self.conversation_store.trim(
-            [*self._conversation_history, {"role": "user", "content": prompt}]
-        )
+        try:
+            self.conversation_store.save_pending(prompt)
+            self.conversation_store.append("user", prompt)
+        except (OSError, ValueError) as error:
+            self.prompt_input.value = prompt
+            self._write_warning(f"Could not save conversation turn: {error}")
+            return
+        self._conversation_history = self.conversation_store.load()
         self.prompt_input.remember_input(prompt)
-        self.conversation_store.save(self._conversation_history)
 
-        user_line = Text()
-        user_line.append("\nUser: ", style=f"bold {WALLACE_THEME['user']}")
-        user_line.append(prompt)
-        self.chat_log.write(user_line)
+        self._write_chat_block(self._user_chat_line(prompt))
 
         self._set_busy(True)
         agent_prompt = prompt
@@ -898,7 +1349,7 @@ class AgentTUI(App):
                 SAFE_ROOT, prompt, session_id=self.thread_id
             )
             agent_prompt = planning_context(self._active_plan) + "\nUser request:\n" + prompt
-            self.chat_log.write(
+            self._write_chat_block(
                 Text(
                     f"Plan {self._active_plan.plan_id}: "
                     f"{self._active_plan.next_pending().title if self._active_plan.next_pending() else 'complete'}",
@@ -919,12 +1370,26 @@ class AgentTUI(App):
                     "tools before relying on their previous contents.\n\n"
                     f"{agent_prompt}"
                 )
+        host_response = local_datetime_response(prompt)
+        if host_response is not None:
+            self._write_chat_block(Text("AI:", style=f"bold {WALLACE_THEME['assistant']}"))
+            self.chat_log.write(Markdown(host_response))
+            try:
+                if self._active_plan is not None:
+                    self._active_plan.record_progress([], response=host_response)
+                    save_plan(SAFE_ROOT, self._active_plan)
+                self.conversation_store.append("assistant", host_response)
+                self._conversation_history = self.conversation_store.load()
+                self.conversation_store.clear_pending()
+                self.thread_manager.touch(self.thread_id)
+                self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
+            except (OSError, ValueError) as error:
+                self._write_warning(f"Could not save local date/time answer: {error}")
+            self._set_busy(False)
+            return
         self.run_turn(
             agent_prompt,
             user_prompt=prompt,
-            # ConversationStore remains available for the visible TUI log and
-            # reload recovery, but is deliberately not replayed into the model.
-            # The durable plan is the compact cross-turn context.
             seed_messages=None,
         )
 
@@ -942,10 +1407,30 @@ class AgentTUI(App):
         payload = {"messages": [*(seed_messages or []), {"role": "user", "content": prompt}]}
         recovery_attempted = False
         empty_response_retried = False
+        quality_retried = False
         response = None
         self._shown_tool_calls: set[tuple] = set()
         self._shown_tool_results: set[tuple] = set()
+        initial_prompt = prompt
         try:
+            if user_prompt is not None:
+                memory = ""
+                try:
+                    memory, memory_warning = await self.conversation_store.memory_context(
+                        user_prompt,
+                        partial(
+                            summarize_thread_memory,
+                            model_name=self.model_name,
+                            credentials=self.credentials,
+                        ),
+                        max_chars=memory_budget_for(prompt),
+                    )
+                    if memory_warning:
+                        self._write_warning(memory_warning)
+                except (OSError, ValueError) as error:
+                    self._write_warning(f"Conversation memory unavailable: {error}")
+                initial_prompt = with_thread_memory(memory, prompt)
+                payload["messages"][-1]["content"] = initial_prompt
             while True:
                 interrupts = []
                 try:
@@ -972,7 +1457,7 @@ class AgentTUI(App):
                             "recovering from the saved turn state."
                         )
                         payload = await malformed_retry_payload(
-                            self.agent, self.thread_config, prompt
+                            self.agent, self.thread_config, initial_prompt
                         )
                         continue
                     raise
@@ -1002,6 +1487,40 @@ class AgentTUI(App):
                             {"role": "user", "content": EMPTY_RESPONSE_RETRY_PROMPT}
                         ]}
                         continue
+                    if response is not None and user_prompt is not None:
+                        previous_assistant = next(
+                            (
+                                item["content"] for item in reversed(self.conversation_store.load_all())
+                                if item["role"] == "assistant"
+                            ),
+                            None,
+                        )
+                        quality_error = response_quality_error(
+                            response,
+                            previous_assistant=previous_assistant,
+                            current_request=user_prompt,
+                        )
+                        if (
+                            quality_error is not None
+                            and not quality_retried
+                            and (self._active_plan is None or self._active_plan.intent == "general task")
+                            and not model_tool_activity(turn_messages)
+                        ):
+                            quality_retried = True
+                            self._write_warning(
+                                "The model echoed or looped; retrying the simple request "
+                                "once without prior replies."
+                            )
+                            self.thread_config = new_thread_config()
+                            payload = {"messages": [{
+                                "role": "user",
+                                "content": clean_response_retry_prompt(user_prompt),
+                            }]}
+                            turn_messages = []
+                            response = None
+                            recovery_attempted = False
+                            empty_response_retried = False
+                            continue
                     break
 
                 # The agent paused for approval: ask, then resume the same run.
@@ -1036,36 +1555,44 @@ class AgentTUI(App):
                         error=status,
                     )
                     save_plan(SAFE_ROOT, self._active_plan)
-                self.chat_log.write(
+                self._write_chat_block(
                     Text(
                         status,
                         style=WALLACE_THEME["error"],
                     )
                 )
             else:
-                quality_error = response_quality_error(response)
+                previous_assistant = next(
+                    (
+                        item["content"] for item in reversed(self.conversation_store.load_all())
+                        if item["role"] == "assistant"
+                    ),
+                    None,
+                )
+                quality_error = response_quality_error(
+                    response,
+                    previous_assistant=previous_assistant,
+                    current_request=user_prompt or "",
+                )
                 if quality_error is not None:
                     raise RepetitiveResponseError(quality_error)
-                self.chat_log.write(
-                    Text("AI:", style=f"bold {WALLACE_THEME['assistant']}")
-                )
-                self.chat_log.write(Markdown(response))
                 if self._active_plan is not None:
-                    self._active_plan.record_progress(
-                        model_tool_activity(turn_messages),
-                        response=response,
+                    response = verified_plan_response(
+                        self._active_plan, response, model_tool_activity(turn_messages)
                     )
                     save_plan(SAFE_ROOT, self._active_plan)
                     self.thread_manager.touch(self.thread_id)
                     self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
+                self._write_chat_block(
+                    Text("AI:", style=f"bold {WALLACE_THEME['assistant']}")
+                )
+                self.chat_log.write(Markdown(response))
                 if user_prompt is not None:
-                    self._conversation_history.append(
-                        {"role": "assistant", "content": response}
-                    )
-                    self._conversation_history = self.conversation_store.trim(
-                        self._conversation_history
-                    )
-                    self.conversation_store.save(self._conversation_history)
+                    saved = self.conversation_store.load_all()
+                    if not saved or saved[-1] != {"role": "user", "content": user_prompt}:
+                        self.conversation_store.append("user", user_prompt)
+                    self.conversation_store.append("assistant", response)
+                    self._conversation_history = self.conversation_store.load()
                     self.conversation_store.clear_pending()
 
         except Exception as error:
@@ -1077,9 +1604,9 @@ class AgentTUI(App):
                     pass
                 try:
                     recorded_error = (
-                        describe_error(error)
+                        self.credentials.redact(describe_error(error, self.model_name))
                         if is_malformed_tool_call_error(error)
-                        else str(error)
+                        else self.credentials.redact(str(error))
                     )
                     self._active_plan.record_progress(
                         model_tool_activity(turn_messages), error=recorded_error
@@ -1087,7 +1614,7 @@ class AgentTUI(App):
                     save_plan(SAFE_ROOT, self._active_plan)
                 except Exception:
                     pass
-            self._write_warning(describe_error(error))
+            self._write_warning(describe_error(error, self.model_name))
         finally:
             # Keep only the current turn's tool transcript in the graph.
             self.thread_config = new_thread_config()
@@ -1095,8 +1622,11 @@ class AgentTUI(App):
 
     async def _ask_approval(self, request: dict) -> bool:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
+        detail = self.credentials.redact(format_action_request(request))
+        if parse_model_selection(self.model_name)[0] != "ollama":
+            detail = f"{CLOUD_TOOL_WARNING}\n\n{detail}"
         self.push_screen(
-            ApprovalScreen(format_action_request(request)),
+            ApprovalScreen(detail),
             lambda result: future.done() or future.set_result(bool(result)),
         )
         return await future
@@ -1134,7 +1664,7 @@ class AgentTUI(App):
                 rotate=True,
                 message=f"Reviewing {name} results",
             )
-            failed = getattr(msg, "status", None) == "error" or str(msg.content).startswith("Error")
+            failed = tool_result_failed(str(msg.content), getattr(msg, "status", None))
             if failed:
                 self.chat_log.write(
                     Text(f"  ✗ {name} failed", style=f"dim {WALLACE_THEME['error']}")
@@ -1150,6 +1680,7 @@ class AgentTUI(App):
                 self.workspace_panel.refresh_view(f"Finished {name}")
 
     def _write_warning(self, message: str) -> None:
+        message = self.credentials.redact(message)
         self.chat_log.write(Text(message, style=WALLACE_THEME["warning"]))
         if self.workspace_panel is not None:
             self.workspace_panel.refresh_view(message)
@@ -1157,14 +1688,20 @@ class AgentTUI(App):
     # ---------- actions ----------
 
     def _update_header_datetime(self) -> None:
-        """Keep the local weekday, date and time alongside Wallace."""
-        self.sub_title = datetime.now().astimezone().strftime("%A, %Y-%m-%d %H:%M")
+        """Keep local time and one theme-appropriate sky icon alongside Wallace."""
+        now = datetime.now().astimezone()
+        # Emoji-focused themes can opt in; current presets retain text symbols.
+        emoji = self.current_theme.variables.get("sky-icon-style") == "emoji"
+        icon, description = sky_icons(now, emoji=emoji)
+        self.sub_title = f"{now:%A, %Y-%m-%d %H:%M}  {icon}"
+        self.query_one(Header).tooltip = description
 
     def _switch_thread(self, thread_id: str) -> None:
         if self._busy:
             self._write_warning("Finish or cancel the current request before switching threads.")
             return
         record = self.thread_manager.resolve(thread_id)
+        self.thread_manager.select_thread(record.thread_id)
         self.thread_id = record.thread_id
         self.conversation_store = self.thread_manager.store(self.thread_id)
         self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
@@ -1179,10 +1716,10 @@ class AgentTUI(App):
         self._active_plan = None
         self.thread_config = new_thread_config()
         self.chat_log.clear()
-        self.chat_log.write(Text(f"Thread: {record.thread_id} — {record.title}", style=WALLACE_THEME["success"]))
+        self._write_chat_block(Text(f"Thread: {record.thread_id} — {record.title}", style=WALLACE_THEME["success"]))
         self._restore_conversation()
         if self.conversation_store.load_pending():
-            self.chat_log.write(Text("This thread has an interrupted request; send it again to resume.", style=WALLACE_THEME["warning"]))
+            self._write_chat_block(Text("This thread has an interrupted request; send it again to resume.", style=WALLACE_THEME["warning"]))
 
     def _handle_thread_command(self, command: str) -> None:
         try:
@@ -1194,7 +1731,35 @@ class AgentTUI(App):
             return
         action = parts[0].lower()
         try:
-            if action in {"/theme", "/themes"}:
+            if action == "/key":
+                if len(parts) != 1:
+                    self._write_warning("Use /key with no argument; enter the secret in the masked dialog.")
+                elif not self._busy:
+                    self._set_busy(True)
+                    self.change_cloud_key()
+            elif action in {"/model", "/models"}:
+                if action == "/models":
+                    if len(parts) > 2 or (len(parts) == 2 and parts[1].lower() not in {"ollama", "openai", "gemini"}):
+                        raise ValueError("use /models [ollama|openai|gemini]")
+                    if not self._busy:
+                        self._set_busy(True)
+                        self.show_models(parts[1].lower() if len(parts) == 2 else None)
+                elif len(parts) == 1:
+                    self.action_show_models()
+                else:
+                    if not self._busy:
+                        self._set_busy(True)
+                        self.change_model(" ".join(parts[1:]))
+            elif action in {"/mcp", "/mcps"}:
+                operation, name, url, keywords = parse_mcp_command(parts[1:], SAFE_ROOT)
+                if operation == "list":
+                    self.action_show_mcp()
+                else:
+                    if self._busy:
+                        self._write_warning("Finish the current request before changing MCP servers.")
+                    else:
+                        self.change_mcp(operation, name, url, keywords)
+            elif action in {"/theme", "/themes"}:
                 if len(parts) == 1:
                     self.action_change_theme()
                 else:
@@ -1203,10 +1768,11 @@ class AgentTUI(App):
                         "retro-terminal": "retro",
                         "sophistication": "elegant",
                         "sophisticated": "elegant",
-                        "futuristic": "future",
-                        "night": "night-mode",
-                        "red": "red-light",
-                        "redlight": "red-light",
+                        "night-mode": "night",
+                        "red-light": "red",
+                        "redlight": "red",
+                        "vapor": "vaporwave",
+                        "grey": "grayscale",
                     }.get(reference, reference)
                     candidates = (reference, f"wallace-{reference}", f"omarchy-{reference}")
                     selected = next((name for name in candidates if self.get_theme(name)), None)
@@ -1242,7 +1808,7 @@ class AgentTUI(App):
             elif action == "/clear":
                 self.action_clear_log()
             else:
-                self._write_warning("Commands: /threads, /new [title], /switch <id or title>, /rename <title>, /remove <id or title>, /clear")
+                self._write_warning("Commands: /threads, /new [title], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /key")
         except (OSError, ValueError) as error:
             self._write_warning(f"Thread command failed: {error}")
 
@@ -1256,7 +1822,7 @@ class AgentTUI(App):
         )
 
     def _refresh_workspace(self) -> None:
-        if self.workspace_panel is not None:
+        if self.workspace_panel is not None and self.workspace_panel.query("#workspace_tree"):
             self.workspace_panel.refresh_view()
 
     def action_toggle_workspace(self) -> None:
@@ -1288,6 +1854,7 @@ class AgentTUI(App):
             )
 
     def on_unmount(self) -> None:
+        self.credentials.clear()
         _write_reload_status("idle")
 
 

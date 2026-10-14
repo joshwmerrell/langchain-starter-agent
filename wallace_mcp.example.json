@@ -1,0 +1,11 @@
+{
+  "langchain_docs_enabled": true,
+  "servers": [
+    {
+      "name": "my-server",
+      "url": "https://example.com/mcp",
+      "enabled": false,
+      "keywords": ["example"]
+    }
+  ]
+}

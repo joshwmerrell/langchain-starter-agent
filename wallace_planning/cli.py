@@ -20,6 +20,7 @@ _INTENTS = (
     ("research", ("research", "look up", "compare")),
 )
 _CONTINUE_RE = re.compile(r"^(?:please\s+)?(?:continue|resume|proceed|finish)(?:\b|$)", re.I)
+_RETRY_RE = re.compile(r"^(?:please\s+)?(?:try\s+again|retry(?:\s+that)?)[.!?\s]*$", re.I)
 _EXPLICIT_RESUME_RE = re.compile(
     r"\b(?:resume|continue|proceed|finish)\s+(?:(?:with|on)\s+)?"
     r"(?:the\s+)?(?:(?:latest|current|active|existing|previous)\s+){1,3}"
@@ -30,16 +31,31 @@ _FEATURE_LIST_RE = re.compile(
     r"\b(?:pipeline|features?|requirements?|capabilities|tasks?)\s*:\s*([^\n.]+)",
     re.I,
 )
+_CODE_CHECK_RE = re.compile(
+    r"\b(?:code|source|files?|website|site|app|scripts?|program|build|syntax)\b"
+    r"|\b[A-Za-z0-9_.-]+\.(?:py|js|mjs|ts|tsx|html|css|sh|go|rs)\b",
+    re.I,
+)
 
 
 def _requests_continuation(request: str) -> bool:
-    if _CONTINUE_RE.match(request):
+    if _CONTINUE_RE.match(request) or _RETRY_RE.fullmatch(request):
         return True
     for match in _EXPLICIT_RESUME_RE.finditer(request):
         before = request[max(0, match.start() - 24):match.start()]
         if not re.search(r"\b(?:do not|don't|never|without)\s*$", before, re.I):
             return True
     return False
+
+
+def _no_op_retry_plan(plan: PlanSpec) -> bool:
+    """Legacy one-step retry records are not the task being retried."""
+    return bool(
+        _RETRY_RE.fullmatch(plan.request.strip())
+        and plan.intent == "general task"
+        and not plan.edit_evidence.get("targets")
+        and not plan.unresolved_failures
+    )
 
 
 def _feature_requirements(request: str) -> list[str]:
@@ -139,6 +155,12 @@ def parse_request(project_root: Path, request: str, *, session_id: str | None = 
         constraints.append("Inspect referenced files before modifying them.")
     if intent in {"implement", "fix", "refactor"}:
         steps = _implementation_steps(request, sources)
+    elif intent == "test" and _CODE_CHECK_RE.search(request):
+        steps = [
+            PlanStep("step-01", "Inspect relevant context", "Read the relevant files and existing tests.", sources=sources),
+            PlanStep("step-02", "Run relevant checks", "Run source checks or tests and resolve failures before claiming success."),
+            PlanStep("step-03", "Summarize and hand off", "Report observed results and any remaining limitations."),
+        ]
     elif intent in {"review", "research", "test"}:
         steps = [
             PlanStep("step-01", "Inspect relevant context", "Read the relevant files or run the relevant checks.", sources=sources),
@@ -172,8 +194,14 @@ def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
     tool_section = "\n".join(
         f"- {'OK' if item['ok'] else 'FAILED'}: {item['name']} "
         f"{bounded(item['target'], 100)}: {bounded(item['outcome'], 40)}"
+        + (f" ({bounded(item.get('diagnostic'), 100)})" if item.get("diagnostic") else "")
         for item in plan.tool_history[-8:]
     ) or "- None recorded."
+    unchecked = plan.unchecked_targets()
+    unchecked_section = (
+        "Files still needing matching checks: " + ", ".join(unchecked[:8]) + "\n"
+        if unchecked else ""
+    )
     remaining = "\n".join(
         f"- {step.id}: {bounded(step.title, 100)}"
         for step in plan.steps if step.status != "complete"
@@ -199,6 +227,7 @@ def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
         "Recent tool calls (failed targets are not validated; do not repeat "
         "unchanged failed commands):\n"
         f"{tool_section}\n"
+        f"{unchecked_section}"
         f"{error_section}"
         "The plan state above is supplied by the host. Do not try to read private "
         "Wallace state with project file tools.\n"
@@ -232,11 +261,18 @@ def resume_or_create(project_root: Path, request: str, *, session_id: str | None
     candidates = [plan for plan in session_plans if plan.status == "active"]
     # A retry after a restart resumes the unfinished plan for the same request.
     # A different request gets its own plan, even within the same session.
-    matching = [plan for plan in candidates if plan.request == normalized]
+    matching = [
+        plan for plan in candidates
+        if plan.request == normalized and not _no_op_retry_plan(plan)
+    ]
     if matching:
         return _upgrade_generic_plan(project_root, max(matching, key=lambda plan: plan.updated_at))
     if _requests_continuation(normalized) and session_plans:
-        latest = max(session_plans, key=lambda plan: plan.updated_at)
+        # Older releases stored terse retries as completed one-step plans.
+        # Ignore those no-op records so a later "continue" can still recover
+        # the unfinished substantive task in the same thread.
+        substantive = [plan for plan in session_plans if not _no_op_retry_plan(plan)]
+        latest = max(substantive or session_plans, key=lambda plan: plan.updated_at)
         if latest.status == "active":
             return _upgrade_generic_plan(project_root, latest)
     return parse_request(project_root, request, session_id=session_id)

@@ -133,6 +133,40 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertNotIn(line, issue)
         self.assertIsNone(response_quality_error("I inspected main.py and found the issue."))
 
+    def test_copied_prior_reply_and_single_line_word_salad_are_rejected(self):
+        previous = (
+            "I'm Wallace, your all-around assistant. Here are my capabilities: "
+            + " ".join(f"capability{index}" for index in range(90))
+        )
+        copied = previous + "I will now answer the user's new question."
+        self.assertIn(
+            "copied an earlier reply",
+            response_quality_error(
+                copied,
+                previous_assistant=previous,
+                current_request="What is the date?",
+            ),
+        )
+        word_salad = "Capabilities include " + (
+            "sorting ranking ordering filtering grouping clustering partitioning " * 90
+        )
+        self.assertIn("repetitive response", response_quality_error(word_salad))
+        self.assertIsNone(response_quality_error(
+            previous,
+            previous_assistant=previous,
+            current_request="Create an HTML page about you.",
+        ))
+        short_nonanswer = "I can answer directly. I'll provide the information in the next response. " * 3
+        self.assertIn(
+            "copied an earlier reply",
+            response_quality_error(
+                short_nonanswer,
+                previous_assistant=short_nonanswer,
+                current_request="What is 2+2?",
+            ),
+        )
+        self.assertIsNone(response_quality_error("The answer is four."))
+
     def test_no_text_status_reports_observed_work_without_claiming_completion(self):
         class Plan:
             def next_pending(self):

@@ -19,6 +19,56 @@ from wallace_planning import (
 
 
 class PlanningTests(unittest.TestCase):
+    def test_code_verification_cannot_finish_after_reads_or_failed_checks(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Verify the code in test_site/app.ts and test it")
+            self.assertEqual(plan.intent, "test")
+            self.assertEqual(len(plan.steps), 3)
+            response = verified_plan_response(plan, "The site is verified.", [{
+                "id": "read", "name": "read_safe_file", "target": "test_site/app.ts",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertEqual(plan.status, "active")
+            self.assertIn("Required code checks or tests have not passed", response)
+            response = verified_plan_response(plan, "The site is verified.", [{
+                "id": "failed-check", "name": "check_source_file", "target": "test_site/app.ts",
+                "outcome": "Exit code: 1", "diagnostic": "TypeScript type-check failed (TS2584)",
+                "ok": False,
+            }])
+            self.assertEqual(plan.status, "active")
+            self.assertIn("TS2584", response)
+            self.assertNotIn("The site is verified", response)
+            verified_plan_response(plan, "The site passed its checks.", [{
+                "id": "passed-check", "name": "check_source_file", "target": "test_site/app.ts",
+                "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertEqual(plan.status, "complete")
+
+    def test_non_code_testing_request_does_not_require_source_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Test me on history")
+            self.assertEqual(plan.intent, "test")
+            self.assertEqual(len(plan.steps), 2)
+
+    def test_review_plan_cannot_finish_with_unvalidated_edits(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Review test_site/index.html")
+            response = verified_plan_response(plan, "The page is ready.", [
+                {"id": "read", "name": "read_safe_file", "target": "test_site/index.html", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "replace_in_file", "target": "test_site/index.html", "outcome": "ok", "ok": True},
+            ])
+            self.assertEqual(plan.status, "active")
+            self.assertIn("Files needing matching validation", response)
+            verified_plan_response(plan, "The page is checked.", [{
+                "id": "check", "name": "check_source_file", "target": "test_site/index.html",
+                "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertEqual(plan.status, "complete")
+
     def test_create_and_round_trip_plan_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -231,15 +281,59 @@ class PlanningTests(unittest.TestCase):
             plan.record_progress([], response="I am still working.")
             self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete", "pending", "pending"])
             plan.record_progress([
-                {"id": "edit-2", "name": "replace_in_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "edit-2", "name": "replace_in_file", "target": "translator.py", "outcome": "ok", "ok": True},
                 {"id": "test-2", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
             ], response="Implemented and tested translation.")
             self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete", "complete", "pending"])
             plan.record_progress([
-                {"id": "edit-3", "name": "replace_in_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "edit-3", "name": "replace_in_file", "target": "validator.py", "outcome": "ok", "ok": True},
                 {"id": "test-3", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
             ], response="Implemented and tested output validation.")
             self.assertEqual(plan.status, "complete")
+
+    def test_tool_registry_edit_requires_contract_check_after_latest_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Implement a new tool in tools.py")
+            plan.record_progress([
+                {"id": "read", "name": "read_safe_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "replace_in_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "tests", "name": "run_tests", "target": "tests", "outcome": "Exit code: 0", "ok": True},
+            ], response="The tests pass.")
+            self.assertEqual(plan.status, "active")
+            plan.record_progress([{
+                "id": "contract", "name": "verify_tool_contract", "target": "new_tool",
+                "outcome": "ok", "ok": True,
+            }], response="The new tool is registered and its test passes.")
+            self.assertEqual(plan.status, "complete")
+            plan.record_progress([{
+                "id": "edit-again", "name": "replace_in_file", "target": "tools.py",
+                "outcome": "ok", "ok": True,
+            }], response="Adjusted the tool.")
+            self.assertEqual(plan.status, "active")
+
+    def test_edit_proof_survives_short_journal_and_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Implement a new tool in tools.py", session_id="work")
+            activity = [
+                {"id": "read", "name": "read_safe_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "replace_in_file", "target": "tools.py", "outcome": "ok", "ok": True},
+                {"id": "contract", "name": "verify_tool_contract", "target": "new_tool", "outcome": "ok", "ok": True},
+            ]
+            activity.extend({
+                "id": f"extra-{number}", "name": "search_in_files", "target": "tests",
+                "outcome": "ok", "ok": True,
+            } for number in range(20))
+            plan.record_progress(activity, error="malformed tool call")
+            self.assertNotIn("edit", {item["id"] for item in plan.tool_history})
+            from wallace_planning import save_plan
+            save_plan(root, plan)
+            restored = load_plan(root, "work", plan.plan_id)
+            self.assertEqual(restored.edit_evidence["target"], "tools.py")
+            self.assertIn("verify_tool_contract", restored.edit_evidence["validations"])
+            restored.record_progress(activity, response="The tool is verified.")
+            self.assertEqual(restored.status, "complete")
+            self.assertEqual(len(restored.seen_tool_call_ids), len(activity))
 
     def test_implementation_plan_requires_observed_edit_and_validation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -296,6 +390,59 @@ class PlanningTests(unittest.TestCase):
             context = planning_context(resumed)
             self.assertIn("Original request: Implement main.py", context)
             self.assertIn("Last error:", context)
+
+    def test_try_again_resumes_unfinished_work_in_the_same_thread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unfinished = parse_request(root, "Fix test_site/app.ts", session_id="work")
+            other = parse_request(root, "Fix other.py", session_id="other")
+            for step in other.steps:
+                step.status = "complete"
+            other.refresh_status()
+            from wallace_planning import save_plan
+            save_plan(root, other)
+            for request in ("Try again.", "Please try again!", "retry that"):
+                resumed = resume_or_create(root, request, session_id="work")
+                self.assertEqual(resumed.plan_id, unfinished.plan_id)
+
+    def test_continue_skips_legacy_no_op_retry_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unfinished = parse_request(root, "Fix test_site/app.ts", session_id="work")
+            noop = parse_request(root, "Try again.", session_id="work")
+            noop.record_progress([], response="Done")
+            from wallace_planning import save_plan
+            save_plan(root, noop)
+            resumed = resume_or_create(root, "Continue", session_id="work")
+            self.assertEqual(resumed.plan_id, unfinished.plan_id)
+
+    def test_retry_skips_active_legacy_no_op_retry_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unfinished = parse_request(root, "Fix test_site/app.ts", session_id="work")
+            noop = parse_request(root, "Try again.", session_id="work")
+            resumed = resume_or_create(root, "Try again.", session_id="work")
+            self.assertNotEqual(noop.plan_id, resumed.plan_id)
+            self.assertEqual(resumed.plan_id, unfinished.plan_id)
+
+    def test_generic_request_cannot_complete_with_unchecked_file_edits(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Do it", session_id="work")
+            answer = verified_plan_response(plan, "The CSS passed validation.", [{
+                "id": "edit", "name": "write_safe_file", "target": "test_site/styles.css",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertEqual(plan.status, "active")
+            self.assertIn("test_site/styles.css", answer)
+            self.assertNotIn("passed validation", answer)
+            verified = verified_plan_response(plan, "CSS checked.", [{
+                "id": "check", "name": "check_source_file", "target": "test_site/styles.css",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertEqual(verified, "CSS checked.")
+            self.assertEqual(plan.status, "complete")
 
     def test_plan_context_does_not_repeat_unverified_assistant_summary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -374,6 +521,124 @@ class PlanningTests(unittest.TestCase):
             ], response="Done")
             self.assertEqual(plan.steps[2].status, "pending")
             self.assertEqual(plan.status, "active")
+
+    def test_unrelated_python_check_and_failed_web_checks_cannot_complete_site(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Build a website in test_site")
+            activity = [
+                {"id": "read", "name": "read_safe_file", "target": "README.md", "outcome": "ok", "ok": True},
+                {"id": "html", "name": "write_safe_file", "target": "test_site/index.html", "outcome": "ok", "ok": True},
+                {"id": "ts", "name": "write_safe_file", "target": "test_site/app.ts", "outcome": "ok", "ok": True},
+                {"id": "sh", "name": "write_safe_file", "target": "test_site/build.sh", "outcome": "ok", "ok": True},
+                {"id": "python", "name": "check_python_syntax", "target": "dependency_analysis.py", "outcome": "ok", "ok": True},
+                {"id": "deno", "name": "execute_command", "target": "cd test_site && deno check app.ts", "outcome": "Exit code: 1", "ok": False},
+                {"id": "replace", "name": "replace_in_file", "target": "test_site/app.ts", "outcome": "failed", "diagnostic": "replacement anchor not found; re-read the file", "ok": False},
+            ]
+            handoff = verified_plan_response(plan, "The TypeScript compiles; the site works.", activity)
+            self.assertEqual(plan.status, "active")
+            self.assertIn("has not verified", handoff)
+            self.assertNotIn("compiles; the site works", handoff)
+            self.assertEqual(set(plan.unchecked_targets()), {
+                "test_site/index.html", "test_site/app.ts", "test_site/build.sh",
+            })
+            self.assertEqual(len(plan.unresolved_failures), 2)
+            self.assertIn("replacement anchor not found", planning_context(plan))
+            self.assertIn("Files still needing matching checks", planning_context(plan))
+
+    def test_every_changed_web_source_needs_its_own_check(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Build a JavaScript website")
+            activity = [
+                {"id": "read", "name": "read_safe_file", "target": "README.md", "outcome": "ok", "ok": True},
+                {"id": "ts", "name": "write_safe_file", "target": "site/app.ts", "outcome": "ok", "ok": True},
+                {"id": "js", "name": "write_safe_file", "target": "site/app.js", "outcome": "ok", "ok": True},
+                {"id": "check-ts", "name": "check_source_file", "target": "site/app.ts", "outcome": "Exit code: 0", "ok": True},
+            ]
+            self.assertIn("site/app.js", verified_plan_response(plan, "Done", activity))
+            self.assertEqual(plan.status, "active")
+            from wallace_planning import load_plan, save_plan
+            save_plan(root, plan)
+            restored = load_plan(root, plan.session_id, plan.plan_id)
+            self.assertEqual(restored.unchecked_targets(), ["site/app.js"])
+            result = verified_plan_response(restored, "Done", [{
+                "id": "check-js", "name": "check_source_file", "target": "site/app.js",
+                "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertEqual(result, "Done")
+            self.assertEqual(restored.status, "complete")
+
+    def test_failed_edit_and_check_require_actual_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Fix site/app.ts")
+            plan.record_progress([
+                {"id": "read", "name": "read_safe_file", "target": "site/app.ts", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "replace_in_file", "target": "site/app.ts", "outcome": "ok", "ok": True},
+                {"id": "bad-check", "name": "check_source_file", "target": "site/app.ts", "outcome": "Exit code: 1", "ok": False},
+                {"id": "bad-edit", "name": "replace_in_file", "target": "site/app.ts", "outcome": "failed", "ok": False},
+            ], response="Fixed")
+            self.assertEqual(plan.status, "active")
+            plan.record_progress([{
+                "id": "good-edit", "name": "replace_in_file", "target": "site/app.ts",
+                "outcome": "ok", "ok": True,
+            }], response="Fixed")
+            self.assertEqual([item["name"] for item in plan.unresolved_failures], ["check_source_file"])
+            plan.record_progress([{
+                "id": "good-check", "name": "check_source_file", "target": "site/app.ts",
+                "outcome": "Exit code: 0", "ok": True,
+            }], response="Fixed and verified")
+            self.assertEqual(plan.unresolved_failures, [])
+            self.assertEqual(plan.status, "complete")
+
+    def test_later_edit_reopens_only_its_own_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Build a web page")
+            plan.record_progress([
+                {"id": "read", "name": "read_safe_file", "target": "README.md", "outcome": "ok", "ok": True},
+                {"id": "js", "name": "write_safe_file", "target": "site/app.js", "outcome": "ok", "ok": True},
+                {"id": "css", "name": "write_safe_file", "target": "site/styles.css", "outcome": "ok", "ok": True},
+                {"id": "check-js", "name": "check_source_file", "target": "site/app.js", "outcome": "ok", "ok": True},
+                {"id": "check-css", "name": "check_source_file", "target": "site/styles.css", "outcome": "ok", "ok": True},
+            ], response="Done")
+            self.assertEqual(plan.status, "complete")
+            plan.record_progress([{
+                "id": "edit-css", "name": "replace_in_file", "target": "site/styles.css",
+                "outcome": "ok", "ok": True,
+            }], response="Updated CSS")
+            self.assertEqual(plan.status, "active")
+            self.assertEqual(plan.unchecked_targets(), ["site/styles.css"])
+            self.assertEqual(plan.steps[-1].status, "pending")
+            plan.record_progress([{
+                "id": "recheck-css", "name": "check_source_file", "target": "site/styles.css",
+                "outcome": "ok", "ok": True,
+            }], response="Updated CSS and checked")
+            self.assertEqual(plan.status, "complete")
+
+    def test_failed_compile_command_needs_retry_and_source_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Build app.ts")
+            command = "deno check app.ts"
+            plan.record_progress([
+                {"id": "read", "name": "read_safe_file", "target": "README.md", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "write_safe_file", "target": "app.ts", "outcome": "ok", "ok": True},
+                {"id": "failed", "name": "execute_command", "target": command, "outcome": "Exit code: 1", "ok": False},
+            ], response="Compiled")
+            self.assertEqual(len(plan.unresolved_failures), 1)
+            plan.record_progress([{
+                "id": "recheck", "name": "execute_command", "target": command,
+                "outcome": "Exit code: 0", "ok": True,
+            }], response="Compiled")
+            self.assertEqual(plan.unresolved_failures, [])
+            self.assertEqual(plan.unchecked_targets(), ["app.ts"])
+            plan.record_progress([{
+                "id": "source", "name": "check_source_file", "target": "app.ts",
+                "outcome": "Exit code: 0", "ok": True,
+            }], response="Checked")
+            self.assertEqual(plan.status, "complete")
 
     def test_threads_are_isolated_and_legacy_history_migrates_to_main(self):
         with tempfile.TemporaryDirectory() as directory:
