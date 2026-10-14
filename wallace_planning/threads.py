@@ -14,6 +14,42 @@ from pathlib import Path
 
 
 THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+TRUST_MODES = ("no-trust", "informed-trust", "yes-trust")
+
+
+def validate_trust_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in TRUST_MODES:
+        raise ValueError("trust mode must be no-trust, informed-trust, or yes-trust")
+    return mode
+
+
+def parse_new_thread_arguments(arguments: list[str]) -> tuple[str | None, str]:
+    """Parse a title and an optional --trust MODE without swallowing typos."""
+    title_parts: list[str] = []
+    trust_mode = "no-trust"
+    found_mode = False
+    index = 0
+    while index < len(arguments):
+        part = arguments[index]
+        if part == "--trust":
+            if found_mode or index + 1 >= len(arguments):
+                raise ValueError("use /new [--trust MODE] [title]")
+            trust_mode = validate_trust_mode(arguments[index + 1])
+            found_mode = True
+            index += 2
+        elif part.startswith("--trust="):
+            if found_mode:
+                raise ValueError("specify --trust only once")
+            trust_mode = validate_trust_mode(part.partition("=")[2])
+            found_mode = True
+            index += 1
+        elif part.startswith("--"):
+            raise ValueError(f"unknown /new option: {part}")
+        else:
+            title_parts.append(part)
+            index += 1
+    return " ".join(title_parts) or None, trust_mode
 
 
 def _now() -> str:
@@ -26,6 +62,7 @@ class ThreadRecord:
     title: str
     created_at: str
     updated_at: str
+    trust_mode: str = "no-trust"
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -33,6 +70,7 @@ class ThreadRecord:
             "title": self.title,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "trust_mode": self.trust_mode,
         }
 
     @classmethod
@@ -42,11 +80,14 @@ class ThreadRecord:
         thread_id = str(value.get("thread_id", ""))
         if not THREAD_ID_RE.fullmatch(thread_id):
             raise ValueError("invalid thread identifier")
+        saved_mode = value.get("trust_mode", "no-trust")
+        trust_mode = saved_mode if saved_mode in TRUST_MODES else "no-trust"
         return cls(
             thread_id=thread_id,
             title=str(value.get("title") or thread_id),
             created_at=str(value.get("created_at") or _now()),
             updated_at=str(value.get("updated_at") or _now()),
+            trust_mode=trust_mode,
         )
 
 
@@ -189,17 +230,34 @@ class ConversationThreadManager:
             raise ValueError(f"unknown thread: {thread_id}")
         self._atomic_write(self.active_path, json.dumps({"thread_id": thread_id}) + "\n")
 
-    def create(self, title: str | None = None, thread_id: str | None = None) -> ThreadRecord:
+    def create(
+        self, title: str | None = None, thread_id: str | None = None,
+        trust_mode: str = "no-trust",
+    ) -> ThreadRecord:
         records = self._read_index()
+        trust_mode = validate_trust_mode(trust_mode)
         if thread_id is None:
             thread_id = f"thread_{uuid.uuid4().hex[:12]}"
         thread_id = self.validate_id(thread_id)
         if any(record.thread_id == thread_id for record in records):
             raise ValueError(f"thread already exists: {thread_id}")
-        record = ThreadRecord(thread_id, (title or thread_id).strip()[:120], _now(), _now())
+        record = ThreadRecord(thread_id, (title or thread_id).strip()[:120], _now(), _now(), trust_mode)
         records.append(record)
         self._write_index(records)
         return record
+
+    def set_trust_mode(self, thread_id: str, trust_mode: str) -> ThreadRecord:
+        """Only the host's thread commands call this; the model has no tool for it."""
+        thread_id = self.validate_id(thread_id)
+        trust_mode = validate_trust_mode(trust_mode)
+        records = self._read_index()
+        for record in records:
+            if record.thread_id == thread_id:
+                record.trust_mode = trust_mode
+                record.updated_at = _now()
+                self._write_index(records)
+                return record
+        raise ValueError(f"unknown thread: {thread_id}")
 
     def rename(self, thread_id: str, title: str) -> ThreadRecord:
         thread_id = self.validate_id(thread_id)

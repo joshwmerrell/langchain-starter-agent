@@ -2,7 +2,7 @@ import unittest
 import tempfile
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from textual.widgets import Input
@@ -13,6 +13,7 @@ from main import (
     _invoke_with_approvals,
     describe_error,
     malformed_retry_payload,
+    recover_pending_full_suite,
 )
 from tui_agent import AgentTUI
 from wallace_planning import load_plan, parse_request
@@ -38,6 +39,112 @@ class FakeAgent:
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_host_runs_skipped_full_suite_only_with_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Verify the code in test_site and run tests")
+            plan.record_progress([{
+                "id": "read", "name": "read_safe_file", "target": "README.md",
+                "outcome": "ok", "ok": True,
+            }, {
+                "id": "old-suite", "name": "run_tests", "target": "",
+                "outcome": "Exit code: 5", "ok": False,
+            }])
+            run = AsyncMock(return_value="Exit code: 0\nSTDERR:\nRan 182 tests in 80.0s\n\nOK")
+            approve = AsyncMock(return_value=True)
+            with patch("main._run_host_full_suite", run):
+                summary, activity = await recover_pending_full_suite(plan, [], approve)
+            self.assertIn("182 tests", summary)
+            self.assertEqual(activity[0]["name"], "run_tests")
+            self.assertTrue(activity[0]["ok"])
+            approve.assert_awaited_once_with({
+                "name": "run_tests", "args": {"test_path": "."},
+            })
+            run.assert_awaited_once_with()
+
+    async def test_host_suite_refusal_and_existing_model_attempt_do_not_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Verify the code in test_site and run tests")
+            plan.record_progress([{
+                "id": "read", "name": "read_safe_file", "target": "README.md",
+                "outcome": "ok", "ok": True,
+            }, {
+                "id": "old-suite", "name": "run_tests", "target": "",
+                "outcome": "Exit code: 5", "ok": False,
+            }])
+            run = AsyncMock()
+            approve = AsyncMock(return_value=False)
+            with patch("main._run_host_full_suite", run):
+                summary, activity = await recover_pending_full_suite(plan, [], approve)
+                self.assertIn("not approved", summary)
+                self.assertEqual(activity, [])
+                self.assertIsNone(await recover_pending_full_suite(plan, [{
+                    "name": "run_tests", "target": ".", "ok": False,
+                }], approve))
+            run.assert_not_awaited()
+
+    async def test_host_does_not_complete_site_plan_if_directory_still_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test_site").mkdir()
+            plan = parse_request(root, "Verify the code in test_site and run tests")
+            plan.record_progress([{
+                "id": "read", "name": "read_safe_file", "target": "README.md",
+                "outcome": "ok", "ok": True,
+            }, {
+                "id": "old-suite", "name": "run_tests", "target": "",
+                "outcome": "Exit code: 5", "ok": False,
+            }])
+            with patch("main.__file__", str(root / "main.py")):
+                with patch("main._run_host_full_suite", AsyncMock(return_value="Exit code: 0\nRan 1 test\nOK")):
+                    summary, activity = await recover_pending_full_suite(
+                        plan, [], AsyncMock(return_value=True)
+                    )
+            self.assertIn("still present", summary)
+            plan.record_progress(activity, response=summary)
+            self.assertEqual(plan.status, "active")
+            self.assertIn("host_path_absence_check", [
+                item["name"] for item in plan.unresolved_failures
+            ])
+
+    async def test_tui_host_suite_recovery_completes_stale_validation_plan(self):
+        class StreamAgent:
+            async def astream(self, payload, config, stream_mode):
+                yield {"agent": {"messages": [AIMessage(content="I finished the checks.")]}}
+
+            async def aget_state(self, config):
+                return SimpleNamespace(values={"messages": []})
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tui_agent.SAFE_ROOT", root):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        plan = parse_request(
+                            root, "Verify the code in test_site and run tests",
+                            session_id=app.thread_id,
+                        )
+                        plan.record_progress([{
+                            "id": "read", "name": "read_safe_file", "target": "README.md",
+                            "outcome": "ok", "ok": True,
+                        }, {
+                            "id": "old-suite", "name": "run_tests", "target": "",
+                            "outcome": "Exit code: 5", "ok": False,
+                        }])
+                        app._active_plan = plan
+                        app.agent = StreamAgent()
+                        app.thread_config = {}
+                        with patch.object(app, "_ask_approval", AsyncMock(return_value=True)):
+                            with patch("main._run_host_full_suite", AsyncMock(return_value="Exit code: 0\nRan 5 tests\nOK")):
+                                worker = app.run_turn(
+                                    "Continue executing my request.",
+                                    user_prompt="Continue executing my request.",
+                                )
+                                await worker.wait()
+                        saved = load_plan(root, plan.session_id, plan.plan_id)
+                        self.assertEqual(saved.status, "complete")
+                        self.assertIn("Full project tests passed", app.conversation_store.load_all()[-1]["content"])
+
     async def test_retry_uses_checkpoint_without_replaying_original_prompt(self):
         agent = FakeAgent(fail_count=1)
         result = await _invoke_with_approvals(agent, {}, "Build the feature")

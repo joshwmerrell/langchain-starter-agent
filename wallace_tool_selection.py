@@ -20,7 +20,7 @@ CODE = {
     "analyze_git_change_impact", "run_tests", "run_language_tests",
     "verify_tool_contract",
 }
-EDIT = {"write_safe_file", "replace_in_file", "execute_command"}
+EDIT = {"write_safe_file", "replace_in_file", "edit_file_lines", "execute_command"}
 CODE_WORDS = re.compile(
     r"\b(code|coding|program|python|javascript|typescript|rust|golang|go module|"
     r"compile|syntax|test|bug|fix|implement|refactor|build|tool|roadmap|dependency|"

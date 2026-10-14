@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -41,12 +42,14 @@ MAX_SEARCH_FILE_BYTES = 1_000_000
 MAX_TREE_ENTRIES = 300
 MAX_WRITE_CHARS = 50_000
 MAX_REPLACEMENT_CHARS = 25_000
+MAX_LINE_EDIT_LINES = 80
 COMMAND_TIMEOUT = 30
-TEST_TIMEOUT = 60
+SOURCE_CHECK_TIMEOUT = 60
+TEST_TIMEOUT = 180
 
 ACCESS_DENIED = (
     "Error: Access denied or file not found. Use a project-root-relative path "
-    "as shown by get_project_tree (for example, test_site/app.ts)."
+    "as shown by get_project_tree (for example, main.py)."
 )
 
 
@@ -460,6 +463,13 @@ def check_python_syntax(path: str) -> str:
         path: Python file path relative to the project root.
     """
     target = _resolve(path)
+    if target is not None and not target.is_file() and not Path(path).suffix:
+        # Local models often omit the .py suffix after seeing a test module
+        # name. Accept the unambiguous sibling without weakening path rules.
+        sibling = _resolve(path + ".py")
+        if sibling is not None and sibling.is_file():
+            target = sibling
+            path = path + ".py"
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
     try:
@@ -504,7 +514,7 @@ def check_source_file(path: str) -> str:
             return f"Error reading {path}: {error}"
         result = _run_command(
             ["deno", "fmt", "--no-config", "--no-editorconfig", "--ext", suffix[1:], "-"],
-            timeout=TEST_TIMEOUT, input_text=source,
+            timeout=SOURCE_CHECK_TIMEOUT, input_text=source,
         )
         if result.startswith("Exit code: 0"):
             return (
@@ -538,7 +548,7 @@ def check_source_file(path: str) -> str:
             command.append(str(target))
         if shutil.which(command[0]) is None:
             return f"Error: {command[0]} is not installed; cannot check {path}."
-        result = _run_command(command, timeout=TEST_TIMEOUT)
+        result = _run_command(command, timeout=SOURCE_CHECK_TIMEOUT)
         return f"{result}\nChecker: {command[0]} for {path}"
     commands = {
         ".js": ["node", "--check", str(target)],
@@ -553,7 +563,7 @@ def check_source_file(path: str) -> str:
         return f"Error: unsupported source type {suffix or '(none)'}."
     if shutil.which(command[0]) is None:
         return f"Error: {command[0]} is not installed; cannot check {path}."
-    result = _run_command(command, timeout=TEST_TIMEOUT)
+    result = _run_command(command, timeout=SOURCE_CHECK_TIMEOUT)
     return f"{result}\nChecker: {command[0]} for {path}"
 
 
@@ -738,7 +748,17 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
 
     count = text.count(old_text)
     if count == 0:
-        return "Error: old_text was not found. Re-read the file and copy the text exactly."
+        # A ranged read includes a display-only line-number header. Models
+        # sometimes copy that header together with the real anchor.
+        without_header = re.sub(r"^\[lines \d+-\d+ of \d+\]\n", "", old_text, count=1)
+        if without_header != old_text:
+            old_text = without_header
+            count = text.count(old_text)
+    if count == 0:
+        return (
+            "Error: old_text was not found. Re-read the file and copy the text "
+            "exactly, or use edit_file_lines with current line numbers."
+        )
     if count > 1:
         return f"Error: old_text matches {count} places. Include more surrounding lines to make it unique."
     updated = text.replace(old_text, new_text, 1)
@@ -750,6 +770,78 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
     except OSError as error:
         return f"Error writing {path}: {error}"
     return f"Edited {path}."
+
+
+@tool
+def edit_file_lines(path: str, start_line: int, end_line: int, new_text: str) -> str:
+    """Replace a small 1-based inclusive line range in an existing file.
+
+    Use this when replace_in_file cannot match an exact text block. First read
+    the current file with read_safe_file to obtain line numbers. To insert
+    before start_line, set end_line to start_line - 1. Never use stale line
+    numbers after another edit; read the file again. Python syntax is checked
+    before any change is written.
+
+    Args:
+        path: File path relative to the project root.
+        start_line: First line to replace, starting at 1.
+        end_line: Last line to replace, inclusive; start_line - 1 inserts.
+        new_text: Replacement text; keep the edit short.
+    """
+    target = _resolve_writable(path)
+    if target is None or not target.is_file():
+        return ACCESS_DENIED
+    if len(new_text) > MAX_REPLACEMENT_CHARS:
+        return (
+            f"Error: replacement is {len(new_text)} characters; the maximum is "
+            f"{MAX_REPLACEMENT_CHARS}. Use a short edit."
+        )
+    try:
+        original = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return f"Error reading {path}: {error}"
+    lines = original.splitlines(keepends=True)
+    if not (1 <= start_line <= len(lines) + 1 and start_line - 1 <= end_line <= len(lines)):
+        return f"Error: line range is invalid for a file with {len(lines)} lines. Re-read the file."
+    if end_line - start_line + 1 > MAX_LINE_EDIT_LINES:
+        return f"Error: edit spans more than {MAX_LINE_EDIT_LINES} lines. Use smaller edits."
+    before = "".join(lines[:start_line - 1])
+    after = "".join(lines[end_line:])
+    replacement = new_text
+    if end_line == start_line - 1 and before and not before.endswith("\n") and replacement:
+        replacement = "\n" + replacement
+    # A missing terminal newline must not accidentally join the next line.
+    if replacement and not replacement.endswith("\n") and (after or (
+        end_line >= start_line and lines[end_line - 1].endswith("\n")
+    )):
+        replacement += "\n"
+    updated = before + replacement + after
+    if updated == original:
+        return "Error: edit makes no change. Re-read the file."
+    syntax_error = _python_write_error(target, updated)
+    if syntax_error is not None:
+        return syntax_error
+    try:
+        _atomic_write_text(target, updated)
+    except OSError as error:
+        return f"Error writing {path}: {error}"
+    return f"Edited {path} lines {start_line}-{end_line}."
+
+
+def preview_line_edit(path: str, start_line: int, end_line: int, new_text: str) -> str:
+    """Show the actual current lines that a pending line edit would replace."""
+    target = _resolve_writable(path)
+    if target is None or not target.is_file():
+        return f"Path: {path}\n(this path is not writable)"
+    try:
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return f"Path: {path}\n(existing file could not be read)"
+    if not (1 <= start_line <= len(lines) + 1 and start_line - 1 <= end_line <= len(lines)):
+        return f"Path: {path}\n(invalid line range; file has {len(lines)} lines)"
+    removed = [f"- {line}" for line in lines[start_line - 1:end_line]]
+    added = [f"+ {line}" for line in new_text.splitlines()]
+    return f"Path: {path}\nLines: {start_line}-{end_line}\n\n" + "\n".join(removed + added)
 
 
 def preview_write(path: str, content: str) -> str:
@@ -804,6 +896,25 @@ def execute_command(command: str) -> str:
     Args:
         command: The shell command, e.g. "python main.py" or "pip list".
     """
+    # `rm -rf` succeeds even when its target has already gone. Avoid reporting
+    # repeated no-op removals as completed work, especially on resumed plans.
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = []
+    if parts and parts[0] in {"rm", "rmdir", "unlink"} and not re.search(
+        r"[;&|`$\n\r<>]", command
+    ):
+        paths = [part for part in parts[1:] if not part.startswith("-")]
+        if len(paths) == 1 and not Path(paths[0]).is_absolute():
+            target = _resolve(paths[0])
+            lexical = SAFE_ROOT / paths[0]
+            if target is not None and not target.exists() and not lexical.is_symlink():
+                return (
+                    f"Error: {paths[0]} is already absent; removal was not run. "
+                    "Do not repeat removal. Verify absence, then call "
+                    "run_tests(test_path='.') for the remaining checks."
+                )
     return _run_command(command, shell=True)
 
 
@@ -825,6 +936,10 @@ def run_tests(test_path: str = ".") -> str:
         command = [sys.executable, "-m", "pytest", rel, "-q", "--tb=short"]
     else:
         discover_root = rel if target.is_dir() else str(Path(rel).parent)
+        if rel == "." and (SAFE_ROOT / "tests").is_dir():
+            # unittest does not recurse into a tests/ directory without an
+            # __init__.py, unlike pytest. Discover from there explicitly.
+            discover_root = "tests"
         command = [sys.executable, "-m", "unittest", "discover", "-s", discover_root]
         if target.is_file():
             command.extend(["-p", target.name])
@@ -1008,6 +1123,7 @@ TOOLS = [
     analyze_git_change_impact,
     write_safe_file,
     replace_in_file,
+    edit_file_lines,
     execute_command,
     run_tests,
     run_language_tests,

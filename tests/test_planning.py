@@ -10,6 +10,7 @@ from wallace_planning import (
     PlanExecutor,
     PlanStep,
     SourceRef,
+    continuation_instruction,
     create_plan,
     load_plan,
     parse_request,
@@ -19,6 +20,145 @@ from wallace_planning import (
 
 
 class PlanningTests(unittest.TestCase):
+    def test_detailed_user_correction_survives_terse_continue(self):
+        correction = (
+            "Continue the unfinished deletion of test_site. The directory is already "
+            "absent; do not repeat the removal. Run the full tests and report."
+        )
+        history = [
+            {"role": "user", "content": correction},
+            {"role": "assistant", "content": "The plan is unfinished."},
+            {"role": "user", "content": "Continue executing my request."},
+        ]
+        self.assertEqual(
+            continuation_instruction("Continue executing my request.", history),
+            correction,
+        )
+
+    def test_legacy_invalid_syntax_call_does_not_block_real_test_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Verify the code in test_site and run tests")
+            plan.record_progress([{
+                "id": "typo", "name": "check_python_syntax",
+                "target": "tests/test_core_safety", "outcome": "failed", "ok": False,
+            }, {
+                "id": "old-suite", "name": "run_tests", "target": "",
+                "outcome": "Exit code: 5", "ok": False,
+            }])
+            self.assertEqual([item["name"] for item in plan.unresolved_failures], ["run_tests"])
+            context = planning_context(plan)
+            self.assertIn("Unresolved checks", context)
+            self.assertIn("run_tests", context)
+            plan.record_progress([{
+                "id": "real-suite", "name": "run_tests", "target": ".",
+                "outcome": "Exit code: 0", "ok": True,
+            }], response="The full tests passed.")
+            self.assertEqual(plan.unresolved_failures, [])
+            self.assertEqual(plan.status, "complete")
+
+    def test_legacy_delete_context_forbids_repeating_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Proceed with deleting all test-site files.")
+            plan.intent = "test"  # Legacy parser behavior retained in old plans.
+            plan.record_progress([{
+                "id": "rm", "name": "execute_command", "target": "rm -rf test_site",
+                "outcome": "Exit code: 0", "ok": True,
+            }])
+            context = planning_context(
+                plan, latest_instruction="Continue: test_site is absent; do not delete again."
+            )
+            self.assertIn("Do not remove the target again", context)
+            self.assertIn("Latest detailed user instruction", context)
+
+    def test_resume_repairs_old_invalid_invocation_without_erasing_test_failure(self):
+        from wallace_planning import save_plan
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Verify code in test_site", session_id="work")
+            plan.unresolved_failures = [
+                {"name": "check_python_syntax", "target": "tests/test_core_safety", "outcome": "failed", "diagnostic": ""},
+                {"name": "run_tests", "target": "", "outcome": "Exit code: 5", "diagnostic": ""},
+            ]
+            save_plan(root, plan)
+            resumed = resume_or_create(root, "Continue executing my request.", session_id="work")
+            self.assertEqual(resumed.plan_id, plan.plan_id)
+            self.assertEqual([item["name"] for item in resumed.unresolved_failures], ["run_tests"])
+
+    def test_full_suite_success_clears_legacy_default_target_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Verify the project tests")
+            plan.record_progress([{
+                "id": "old", "name": "run_tests", "target": "",
+                "outcome": "Exit code: 5", "ok": False,
+            }])
+            self.assertEqual(len(plan.unresolved_failures), 1)
+            plan.record_progress([{
+                "id": "pass", "name": "run_tests", "target": ".",
+                "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertEqual(plan.unresolved_failures, [])
+
+    def test_line_editor_counts_as_a_real_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Fix example.py")
+            plan.record_progress([{
+                "id": "line-edit", "name": "edit_file_lines", "target": "example.py",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertIn("example.py", plan.unchecked_targets())
+            plan.record_progress([{
+                "id": "syntax", "name": "check_python_syntax", "target": "example.py",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertEqual(plan.unchecked_targets(), [])
+
+    def test_read_only_site_question_is_not_misread_as_creation_or_testing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for request in (
+                "Look at the test site you created and tell me what it features.",
+                "What is the website about?",
+            ):
+                plan = parse_request(root, request)
+                self.assertEqual(plan.intent, "review")
+                self.assertEqual(len(plan.steps), 2)
+
+    def test_deletion_needs_absence_git_and_full_tests_not_just_a_listing(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Delete the site.")
+            self.assertEqual(plan.intent, "delete")
+            self.assertEqual(len(plan.steps), 4)
+            reply = verified_plan_response(plan, "Site fully removed.", [{
+                "id": "read", "name": "get_project_tree", "target": "test_site", "outcome": "ok", "ok": True,
+            }])
+            self.assertIn("No successful deletion command", reply)
+            reply = verified_plan_response(plan, "Site fully removed.", [{
+                "id": "rm", "name": "execute_command", "target": "rm -rf ./test_site", "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertIn("Target absence", reply)
+            reply = verified_plan_response(plan, "Site fully removed.", [
+                {"id": "wrong-absence", "name": "execute_command", "target": "test ! -e ./unrelated", "outcome": "Exit code: 0", "ok": True},
+                {"id": "wrong-git", "name": "get_git_status", "target": "", "outcome": "Exit code: 0", "ok": True},
+                {"id": "wrong-suite", "name": "run_tests", "target": ".", "outcome": "Exit code: 0", "ok": True},
+            ])
+            self.assertIn("Target absence", reply)
+            reply = verified_plan_response(plan, "Site fully removed.", [
+                {"id": "absent", "name": "execute_command", "target": "test ! -e ./test_site", "outcome": "Exit code: 0", "ok": True},
+                {"id": "git", "name": "get_git_status", "target": "", "outcome": "Exit code: 0", "ok": True},
+                {"id": "failed-suite", "name": "run_tests", "target": ".", "outcome": "Exit code: 1", "ok": False},
+            ])
+            self.assertIn("Unresolved run_tests failure", reply)
+            self.assertEqual(plan.status, "active")
+            reply = verified_plan_response(plan, "Site removed and checks passed.", [{
+                "id": "suite", "name": "run_tests", "target": ".", "outcome": "Exit code: 0", "ok": True,
+            }])
+            self.assertEqual(reply, "Site removed and checks passed.")
+            self.assertEqual(plan.status, "complete")
+
     def test_code_verification_cannot_finish_after_reads_or_failed_checks(self):
         from main import verified_plan_response
 
@@ -51,6 +191,37 @@ class PlanningTests(unittest.TestCase):
             plan = parse_request(Path(directory), "Test me on history")
             self.assertEqual(plan.intent, "test")
             self.assertEqual(len(plan.steps), 2)
+
+    def test_verification_followup_resumes_unfinished_deletion_check(self):
+        from main import verified_plan_response
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            deletion = parse_request(root, "Proceed with deleting all test-site files.", session_id="work")
+            self.assertEqual(len(deletion.steps), 4)
+            deletion.record_progress([
+                {"id": "read", "name": "get_project_tree", "target": "test_site", "outcome": "ok", "ok": True},
+                {"id": "delete", "name": "execute_command", "target": "rm -rf ./test_site", "outcome": "Exit code: 0", "ok": True},
+            ], response="Deleted the site.")
+            self.assertEqual(deletion.status, "active")
+            from wallace_planning import save_plan
+            save_plan(root, deletion)
+            followup = resume_or_create(root, "Verify its completion.", session_id="work")
+            self.assertEqual(followup.plan_id, deletion.plan_id)
+
+            # A separate, completed verification reply must not bury the still-active work.
+            shallow = parse_request(root, "Verify its completion.", session_id="work")
+            for step in shallow.steps:
+                step.status = "complete"
+            shallow.refresh_status()
+            save_plan(root, shallow)
+            continued = resume_or_create(root, "Continue finishing the deletion.", session_id="work")
+            self.assertEqual(continued.plan_id, deletion.plan_id)
+
+            response = verified_plan_response(continued, "Everything is cleaned up.", [{
+                "id": "listing", "name": "get_project_tree", "target": "", "outcome": "ok", "ok": True,
+            }])
+            self.assertIn("Target absence, Git status, and full project tests", response)
 
     def test_review_plan_cannot_finish_with_unvalidated_edits(self):
         from main import verified_plan_response

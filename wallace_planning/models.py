@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 import re
+import shlex
 
 StepStatus = Literal["pending", "running", "complete", "failed"]
 PlanStatus = Literal["active", "complete", "failed"]
@@ -72,15 +73,59 @@ def _target_validated(target: str, validations: list[str]) -> bool:
 
 
 def _blocking_failure(item: dict[str, Any]) -> bool:
+    if item["name"] == "check_python_syntax" and Path(str(item["target"])).suffix != ".py":
+        # A malformed tool path is not evidence that source code failed a check.
+        return False
     if item["name"] in {
-        "write_safe_file", "replace_in_file", "check_python_syntax",
+        "write_safe_file", "replace_in_file", "edit_file_lines", "check_python_syntax",
         "check_source_file", "run_tests", "run_language_tests", "verify_tool_contract",
+        "host_path_absence_check",
     }:
         return True
     return item["name"] == "execute_command" and bool(re.search(
         r"\b(?:check|test|build|compile|lint|fmt|tsc|deno)\b",
         str(item["target"]), re.IGNORECASE,
     ))
+
+
+def _safe_command_path(raw: str) -> str | None:
+    path = Path(raw)
+    if (
+        path.is_absolute() or ".." in path.parts or str(path) in {"", "."}
+        or re.search(r"[;&|*?\[\]{}$`\n\r]", raw)
+    ):
+        return None
+    return path.as_posix()
+
+
+def _deletion_target(item: dict[str, Any]) -> str | None:
+    """Extract one literal relative target from a simple removal command."""
+    if item.get("name") != "execute_command":
+        return None
+    try:
+        parts = shlex.split(str(item.get("target", "")))
+    except ValueError:
+        return None
+    if parts[:2] == ["git", "rm"]:
+        parts = parts[2:]
+    elif parts and parts[0] in {"rm", "rmdir", "unlink"}:
+        parts = parts[1:]
+    else:
+        return None
+    paths = [part for part in parts if not part.startswith("-")]
+    return _safe_command_path(paths[0]) if len(paths) == 1 else None
+
+
+def _absence_target(item: dict[str, Any]) -> str | None:
+    if item.get("name") != "execute_command":
+        return None
+    try:
+        parts = shlex.split(str(item.get("target", "")))
+    except ValueError:
+        return None
+    if len(parts) != 4 or parts[:2] != ["test", "!"] or parts[2] not in {"-e", "-d", "-f"}:
+        return None
+    return _safe_command_path(parts[3])
 
 
 def utc_now() -> str:
@@ -322,7 +367,7 @@ class PlanSpec:
         """Give the host a factual handoff instead of an unverified success claim."""
         targets = self.edit_evidence.get("targets", {})
         if self.status == "complete" or (
-            self.intent not in {"implement", "fix", "refactor"}
+            self.intent not in {"implement", "fix", "refactor", "delete"}
             and not (self.intent == "test" and len(self.steps) >= 3)
             and not targets and not self.unresolved_failures
             and not self.failure_overflow
@@ -341,6 +386,11 @@ class PlanSpec:
             details.append("Files needing matching validation: " + ", ".join(unchecked[:5]) + ".")
         if self.intent == "test" and len(self.steps) >= 3 and self.steps[-2].status != "complete":
             details.append("Required code checks or tests have not passed.")
+        if self.intent == "delete" and len(self.steps) >= 4:
+            if self.steps[1].status != "complete":
+                details.append("No successful deletion command was observed.")
+            if self.steps[2].status != "complete":
+                details.append("Target absence, Git status, and full project tests have not all been verified after deletion.")
         if not targets and self.intent in {"implement", "fix", "refactor"}:
             details.append("No successful file edit was verified.")
         if not details:
@@ -366,17 +416,23 @@ class PlanSpec:
         error: str | None = None,
     ) -> None:
         """Record observed work, without treating a polite preamble as completion."""
-        edits = {"write_safe_file", "replace_in_file"}
+        edits = {"write_safe_file", "replace_in_file", "edit_file_lines"}
         validation = {
             "check_python_syntax", "check_source_file", "run_tests",
-            "run_language_tests", "verify_tool_contract",
+            "run_language_tests", "verify_tool_contract", "host_path_absence_check",
         }
         evidence = dict(self.edit_evidence)
         targets = {
             path: {"id": record.get("id", ""), "validations": list(record.get("validations", []))}
             for path, record in evidence.get("targets", {}).items()
         }
-        failures = list(self.unresolved_failures)
+        failures = [
+            failed for failed in self.unresolved_failures
+            if not (
+                failed.get("name") == "check_python_syntax"
+                and Path(str(failed.get("target", ""))).suffix != ".py"
+            )
+        ]
 
         def observe_evidence(item: dict[str, Any], index: int) -> None:
             nonlocal evidence
@@ -420,7 +476,18 @@ class PlanSpec:
                 elif name in validation:
                     failures = [
                         failed for failed in failures
-                        if not (failed["target"] == target and failed["name"] in validation)
+                        if not (
+                            failed["name"] in validation
+                            and (
+                                failed["target"] == target
+                                or (
+                                    name == "run_tests"
+                                    and target.rstrip("/") in {".", "tests"}
+                                    and failed["name"] == "run_tests"
+                                    and failed["target"].rstrip("/") in {"", ".", "tests"}
+                                )
+                            )
+                        )
                     ]
                 elif name == "execute_command":
                     failures = [
@@ -499,7 +566,53 @@ class PlanSpec:
                 step.result = bounded(evidence, MAX_PLAN_RESULT_CHARS)
                 step.updated_at = utc_now()
 
-        if self.intent in {"implement", "fix", "refactor"} and len(self.steps) >= 4:
+        if self.intent == "delete" and len(self.steps) >= 4:
+            if observed & inspection:
+                finish(self.steps[0], "Deletion scope inspected with tools.")
+            deletion_indexes = [
+                index for index, item in enumerate(observed_history)
+                if item["ok"] and _deletion_target(item) is not None
+            ]
+            if deletion_indexes:
+                self.steps[1].tool_args["_deletion_target"] = _deletion_target(
+                    observed_history[deletion_indexes[-1]]
+                )
+                finish(self.steps[1], "Deletion command completed successfully.")
+            # The bounded journal may no longer contain the deletion command;
+            # in that case the durable completed step is the evidence anchor.
+            after_delete = (
+                observed_history[deletion_indexes[-1] + 1:]
+                if deletion_indexes else observed_history if self.steps[1].status == "complete" else []
+            )
+            deleted_target = self.steps[1].tool_args.get("_deletion_target")
+            absence_checked = any(
+                item["ok"] and deleted_target is not None
+                and _absence_target(item) == deleted_target
+                for item in after_delete
+            )
+            git_checked = any(item["ok"] and item["name"] == "get_git_status" for item in after_delete)
+            suite_checked = any(
+                item["ok"] and item["name"] == "run_tests"
+                and str(item["target"]).rstrip("/") in {".", "tests"}
+                for item in after_delete
+            )
+            verified = (
+                self.steps[1].status == "complete" and absence_checked and git_checked
+                and suite_checked and not failures and not self.failure_overflow
+            )
+            if verified:
+                finish(self.steps[2], "Target absence, Git status, and full project tests verified.")
+            elif self.steps[2].status == "complete" and (
+                any(item["ok"] and _deletion_target(item) is not None for item in activity)
+                or any(not item.get("ok", False) and _blocking_failure(item) for item in activity)
+            ):
+                self.steps[2].status = "pending"
+                self.steps[2].result = "Reverify after the latest deletion."
+                self.steps[-1].status = "pending"
+                self.steps[-1].result = "Completion was not verified."
+            if response and not error and all(step.status == "complete" for step in self.steps[:-1]):
+                finish(self.steps[-1], "Final response provided.\n" + bounded(response, 1_000))
+        elif self.intent in {"implement", "fix", "refactor"} and len(self.steps) >= 4:
             if observed & inspection:
                 finish(self.steps[0], "Project context inspected with tools.")
             validation_names = {

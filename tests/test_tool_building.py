@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from main import (
     _load_configured_mcp_tools, approval_policy, focus_tools_on_request,
-    model_tool_activity, run_agent, setup_agent,
+    format_action_request, model_tool_activity, run_agent, setup_agent,
 )
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from tools import (
@@ -34,6 +34,53 @@ class ToolBuildingTests(unittest.TestCase):
             {tool.name for tool in TOOLS if tool.name not in READ_ONLY_TOOLS},
         )
         self.assertIn("verify_tool_contract", TOOLS_REQUIRING_APPROVAL)
+        self.assertIn("edit_file_lines", TOOLS_REQUIRING_APPROVAL)
+
+    def test_line_edit_approval_shows_current_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "example.py").write_text("one\ntwo\n")
+            with patch("tools.SAFE_ROOT", root):
+                prompt = format_action_request({
+                    "name": "edit_file_lines",
+                    "args": {"path": "example.py", "start_line": 2, "end_line": 2, "new_text": "three"},
+                })
+            self.assertIn("- two", prompt)
+            self.assertIn("+ three", prompt)
+
+    def test_default_test_target_is_recorded_for_plan(self):
+        activity = model_tool_activity([
+            AIMessage(content="", tool_calls=[{
+                "id": "suite", "name": "run_tests", "args": {},
+            }]),
+            ToolMessage(content="Exit code: 0", tool_call_id="suite", name="run_tests"),
+        ])
+        self.assertEqual(activity[0]["target"], ".")
+
+    def test_suffixless_syntax_success_is_recorded_with_actual_python_path(self):
+        activity = model_tool_activity([
+            AIMessage(content="", tool_calls=[{
+                "id": "check", "name": "check_python_syntax", "args": {"path": "tests/example"},
+            }]),
+            ToolMessage(
+                content="OK: tests/example.py has valid Python syntax.",
+                tool_call_id="check", name="check_python_syntax",
+            ),
+        ])
+        self.assertEqual(activity[0]["target"], "tests/example.py")
+
+    def test_no_tests_diagnostic_is_saved_without_raw_output(self):
+        activity = model_tool_activity([
+            AIMessage(content="", tool_calls=[{
+                "id": "suite", "name": "run_tests", "args": {},
+            }]),
+            ToolMessage(
+                content="Exit code: 5\nSTDERR:\nRan 0 tests in 0.000s\nNO TESTS RAN",
+                tool_call_id="suite", name="run_tests",
+            ),
+        ])
+        self.assertFalse(activity[0]["ok"])
+        self.assertIn("no tests were discovered", activity[0]["diagnostic"])
 
     def test_source_checker_uses_fixed_language_command_and_reports_failure(self):
         with tempfile.TemporaryDirectory() as directory:

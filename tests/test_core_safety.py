@@ -1,3 +1,4 @@
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,10 +14,106 @@ from main import (
     no_text_status,
     response_quality_error,
 )
-from tools import SAFE_ROOT, _resolve, check_python_syntax, replace_in_file, write_safe_file
+from tools import (
+    SAFE_ROOT, _resolve, check_python_syntax, edit_file_lines, preview_line_edit,
+    execute_command, read_safe_file, replace_in_file, run_tests, write_safe_file,
+)
 
 
 class CoreSafetyTests(unittest.TestCase):
+    def test_syntax_checker_accepts_unambiguous_module_path(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "example.py").write_text("value = 1\n")
+            with patch("tools.SAFE_ROOT", root):
+                self.assertEqual(
+                    check_python_syntax.invoke({"path": "example"}),
+                    "OK: example.py has valid Python syntax.",
+                )
+                self.assertIn("not an accessible Python file", check_python_syntax.invoke({
+                    "path": ".env",
+                }))
+
+    def test_absent_removal_is_not_run_or_reported_as_success(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tools.SAFE_ROOT", root), patch("tools._run_command") as run:
+                result = execute_command.invoke({"command": "rm -rf test_site"})
+                self.assertIn("already absent; removal was not run", result)
+                run.assert_not_called()
+                (root / "test_site").mkdir()
+                run.return_value = "Exit code: 0"
+                self.assertEqual(
+                    execute_command.invoke({"command": "rm -rf test_site"}),
+                    "Exit code: 0",
+                )
+                run.assert_called_once()
+
+    def test_run_tests_discovers_unittest_suite_from_project_root(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            with patch("tools.SAFE_ROOT", root), patch("tools._module_available", return_value=False):
+                with patch("tools._run_command", return_value="Exit code: 0") as run:
+                    self.assertEqual(run_tests.invoke({}), "Exit code: 0")
+            self.assertEqual(run.call_args.args[0][0:6], [
+                sys.executable, "-m", "unittest", "discover", "-s", "tests",
+            ])
+
+    def test_line_editor_replaces_range_and_rejects_invalid_python(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "example.py"
+            target.write_text("def working():\n    return 1\n")
+            with patch("tools.SAFE_ROOT", root):
+                preview = preview_line_edit("example.py", 2, 2, "    return 2")
+                self.assertIn("-     return 1", preview)
+                self.assertIn("+     return 2", preview)
+                result = edit_file_lines.invoke({
+                    "path": "example.py", "start_line": 2, "end_line": 2,
+                    "new_text": "    return (",
+                })
+                self.assertIn("Python syntax error", result)
+                self.assertEqual(target.read_text(), "def working():\n    return 1\n")
+                result = edit_file_lines.invoke({
+                    "path": "example.py", "start_line": 2, "end_line": 2,
+                    "new_text": "    return 2",
+                })
+                self.assertEqual(result, "Edited example.py lines 2-2.")
+                self.assertEqual(target.read_text(), "def working():\n    return 2\n")
+                self.assertIn("invalid", edit_file_lines.invoke({
+                    "path": "example.py", "start_line": 4, "end_line": 4,
+                    "new_text": "pass",
+                }))
+
+    def test_line_editor_keeps_private_files_blocked(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text("placeholder")
+            with patch("tools.SAFE_ROOT", root):
+                self.assertIn("Access denied", edit_file_lines.invoke({
+                    "path": ".env", "start_line": 1, "end_line": 1,
+                    "new_text": "changed",
+                }))
+                self.assertIn("not writable", preview_line_edit(".env", 1, 1, "changed"))
+
+    def test_replace_accepts_display_header_from_ranged_read(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "example.py"
+            target.write_text("def working():\n    return 1\n")
+            with patch("tools.SAFE_ROOT", root):
+                ranged = read_safe_file.invoke({
+                    "path": "example.py", "start_line": 2, "end_line": 2,
+                })
+                self.assertTrue(ranged.startswith("[lines 2-2 of 2]"))
+                result = replace_in_file.invoke({
+                    "path": "example.py", "old_text": ranged,
+                    "new_text": "    return 2\n",
+                })
+            self.assertEqual(result, "Edited example.py.")
+            self.assertEqual(target.read_text(), "def working():\n    return 2\n")
+
     def test_write_safe_file_rejects_invalid_python_without_creating_or_overwriting(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

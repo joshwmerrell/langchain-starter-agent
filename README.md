@@ -29,8 +29,12 @@ treat Wallace as production-ready.
   read-only tool.
 - List project directories with `get_project_tree`, read UTF-8 project files
   with `read_safe_file`, and write/edit project files with `write_safe_file` or
-  `replace_in_file`.
+  `replace_in_file`. If an exact replacement cannot match, `edit_file_lines`
+  can edit a small range after re-reading its current line numbers.
 - Execute shell commands and tests using `execute_command` and `run_tests`.
+  If a resumed validation plan is waiting on a previously failed full-suite
+  run and the model skips it, Wallace asks for the normal tool approval and
+  runs that suite through the host before accepting completion.
 - Persist each conversation thread independently so CLI and TUI sessions can be
   resumed without sharing unrelated history. Older turns are summarized for
   the model while the original text remains in the local thread file.
@@ -42,8 +46,9 @@ treat Wallace as production-ready.
 
 Project file tools are restricted to the project root directory. Commands run
 from the project root using the permissions of the local agent process.
-Python edits made through `write_safe_file` or `replace_in_file` are compiled
-in memory before writing; invalid syntax leaves the original file untouched.
+Python edits made through `write_safe_file`, `replace_in_file`, or
+`edit_file_lines` are compiled in memory before writing; invalid syntax leaves
+the original file untouched.
 This does not replace running the project's tests after a change.
 
 ## Long-term goal
@@ -215,13 +220,13 @@ Ask Wallace for one small tool and its acceptance tests at a time. Local tools
 are registered in `tools.py`; changes to that registry need a passing
 `verify_tool_contract` check against a test file that calls the tool's
 `.invoke(...)` method before an implementation plan can complete. New local
-tools require approval by default until explicitly reviewed as read-only.
+tools follow the active thread's trust mode until explicitly reviewed as read-only.
 Wallace can run `check_source_file` for Python, JavaScript, TypeScript, HTML,
 CSS, shell, JSON, TOML, Go, and Rust files, or `run_language_tests` for Python,
 Deno, npm, Go, and Cargo projects. TypeScript checks use Deno for Deno projects
 and standalone files, or `tsc` for Node projects. Deno checks use cached
 dependencies and do not download packages. These fixed validation commands
-require approval. TypeScript and Rust compiler errors may include type or
+follow the active thread's trust mode. TypeScript and Rust compiler errors may include type or
 dependency failures, not only syntax errors. HTML/CSS checks are basic parse
 checks, not browser or interaction tests. Optional runtimes and test runners
 must already be installed. A newly added tool is
@@ -246,7 +251,7 @@ You can also copy `wallace_mcp.example.json` to `.wallace/mcp_servers.json` and
 edit it yourself. This currently supports remote URL-based MCP servers, not
 local stdio commands. HTTPS is required except for loopback HTTP. The optional
 `keywords` help Wallace offer server tools for relevant requests. All
-user-added MCP tool calls require approval; duplicate tool names are skipped.
+user-added MCP tool calls follow the active thread's trust mode; duplicate tool names are skipped.
 URLs with embedded usernames/passwords, query strings, or fragments are
 rejected; do not put tokens in URL paths either, because Wallace can display
 those paths to the model. Authenticated services need a separately managed
@@ -257,8 +262,9 @@ put API keys in the MCP configuration.
 
 Wallace's model has a read-only tool to view these links and no MCP management
 tool. Its project file-edit tools cannot access `.wallace`. This is not an
-absolute security boundary: approved shell commands still run as your OS user
-and could modify private files. Review shell approvals carefully; strict
+absolute security boundary: shell commands still run as your OS user
+and could modify private files, especially in higher-trust modes. Review trust
+settings and command previews carefully; strict
 protection would require isolating shell execution under a different account
 or sandbox.
 
@@ -275,11 +281,29 @@ connection; if the MCP server cannot be reached, the agent reports the issue
 and continues with the local project-reading tools.
 
 Conversation threads are independent. In either interface, use `/threads` to
-list them, `/new [title]` to create one, `/switch <id or title>` to select one,
+list them, `/new [--trust MODE] [title]` to create one, `/switch <id or title>` to select one,
 `/rename <title>` to rename the current thread, and `/clear` to clear only the
 current thread. Use `/remove <id or title>` (or `/delete`) to remove a thread;
 Wallace keeps the last remaining thread. The CLI also accepts
-`--thread-id <id>` or `--new-thread --thread-title "Title"`.
+`--thread-id <id>` or `--new-thread --thread-title "Title" --trust-mode MODE`.
+Use `/trust` to see the current thread's mode and `/trust <mode>` to change it.
+Every new thread, including one created without an explicit mode, starts in
+`no-trust`. The current mode is shown on startup, after switching threads, and
+in the thread list. It persists across restarts. Wallace's model has no
+dedicated trust-setting tool. Higher-trust shell access under the same OS user
+is not a hard security boundary around Wallace's private state.
+
+- `no-trust`: each approval-required action waits for your Y/N decision.
+- `informed-trust`: the action preview counts down for 10 seconds and then
+  approves automatically. Moving/hovering the mouse, clicking, scrolling, or
+  pressing a key pauses the TUI countdown indefinitely so you can decide with
+  Y/N. In the CLI, any key pauses it; the CLI does not receive mouse hover.
+- `yes-trust`: approval-required tools run without a prompt. This includes
+  file changes, shell commands, tests, and configured MCP tools. Shell and MCP
+  tools can access data under your OS account; use this mode only when you
+  trust the model and connected tools. A cloud model can still request a shell
+  command that reads local credentials even though Wallace does not put API
+  keys directly in model messages.
 Existing `.wallace/conversation.json` history is
 migrated into the default `main` thread the first time Wallace starts.
 Wallace remembers the last selected thread in
@@ -296,6 +320,15 @@ delete words. Ctrl+C/X/V copies, cuts, and pastes; Ctrl+Z undoes and Ctrl+Y
 or Ctrl+Shift+Z redoes an unsent edit. Home/End and their Shift/Ctrl variants
 work as in a single-line editor. The header shows the local weekday, date and
 time. Tool approval dialogs show `Y` for Yes and `N` for No (`Esc` also rejects).
+
+Press F5 or enter `/edit` to search for an existing workspace file, then open
+it in Neovim, Vim, or vi in the same terminal. `/edit path/to/file` opens a
+specific file. The TUI pauses while you edit and resumes afterward; a
+development reload waits until the editor closes. Only user-visible,
+non-sensitive workspace files appear in the picker or can be opened directly;
+the model is not given an editor tool. Save and quit the editor normally
+(`:wq` in Vim/Neovim). This is an external terminal editor, not an embedded
+Vim clone.
 
 Press F9 or enter `/theme` to open the theme picker. Wallace includes
 `wallace-hacker`, `wallace-retro`, `wallace-elegant`, `wallace-dark`,
@@ -376,16 +409,21 @@ and time questions use the computer's clock, not the model's training data.
 The agent uses its tools to inspect or modify project files; the model itself
 does not have direct access to the filesystem. Empty model
 responses and Ollama request failures are reported, and the CLI remains ready
-for another prompt. File changes, shell commands, and test execution require
-approval in the TUI. If pytest is unavailable, `run_tests` falls back to
+for another prompt. File changes, shell commands, and test execution follow
+the active thread's trust mode. If pytest is unavailable, `run_tests` falls back to
 Python's built-in unittest discovery.
 
 The planning executor only runs explicitly registered tools and routes approval
-decisions through the existing approval callback; it never bypasses tool
-approval. Plans are cleaned at session boundaries: completed inactive plans are
+decisions through the active thread's approval policy; it cannot change that
+policy. Plans are cleaned at session boundaries: completed inactive plans are
 archived after 30 days, while older archived artifacts are purged after 90 days
 with a metadata record retained in `index.json`. Active or unresolved plans are
 kept.
+Deletion plans require a successful removal command, a separate target-absence
+check, Git status, and passing full-project tests before Wallace can claim the
+cleanup is verified. A short “verify its completion” or “continue” message
+resumes the relevant unfinished plan in the same thread. Removing files from
+the working tree does not erase them from older Git commits.
 
 ## Updating dependencies
 

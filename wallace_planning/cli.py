@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from pathlib import Path
 
 from .generators import create_plan, list_plans, save_plan
@@ -14,13 +15,18 @@ _PATH_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za
 _INTENTS = (
     ("implement", ("implement", "build", "add", "create", "develop")),
     ("fix", ("fix", "repair", "bug", "debug")),
-    ("review", ("review", "inspect", "audit")),
+    ("review", ("review", "inspect", "audit", "look at", "describe")),
     ("refactor", ("refactor", "restructure", "clean up")),
     ("test", ("test", "verify", "validate")),
     ("research", ("research", "look up", "compare")),
 )
 _CONTINUE_RE = re.compile(r"^(?:please\s+)?(?:continue|resume|proceed|finish)(?:\b|$)", re.I)
 _RETRY_RE = re.compile(r"^(?:please\s+)?(?:try\s+again|retry(?:\s+that)?)[.!?\s]*$", re.I)
+_VERIFY_FOLLOWUP_RE = re.compile(
+    r"^(?:please\s+)?(?:verify|check|confirm)\s+(?:its|that|the)\s+"
+    r"(?:completion|result|deletion|work)\b",
+    re.I,
+)
 _EXPLICIT_RESUME_RE = re.compile(
     r"\b(?:resume|continue|proceed|finish)\s+(?:(?:with|on)\s+)?"
     r"(?:the\s+)?(?:(?:latest|current|active|existing|previous)\s+){1,3}"
@@ -36,16 +42,37 @@ _CODE_CHECK_RE = re.compile(
     r"|\b[A-Za-z0-9_.-]+\.(?:py|js|mjs|ts|tsx|html|css|sh|go|rs)\b",
     re.I,
 )
+_DELETION_RE = re.compile(
+    r"\b(?:delete|deleting|remove|removing|erase|purge)\b.{0,120}"
+    r"\b(?:files?|site|directory|folder|assets?|pages?)\b",
+    re.I | re.S,
+)
 
 
 def _requests_continuation(request: str) -> bool:
-    if _CONTINUE_RE.match(request) or _RETRY_RE.fullmatch(request):
+    if _CONTINUE_RE.match(request) or _RETRY_RE.fullmatch(request) or _VERIFY_FOLLOWUP_RE.match(request):
         return True
     for match in _EXPLICIT_RESUME_RE.finditer(request):
         before = request[max(0, match.start() - 24):match.start()]
         if not re.search(r"\b(?:do not|don't|never|without)\s*$", before, re.I):
             return True
     return False
+
+
+def continuation_instruction(request: str, messages: list[dict[str, str]]) -> str:
+    """Recover the latest detailed user correction behind a terse `continue`."""
+    if not _requests_continuation(request) or len(request) > 100:
+        return request
+    for message in reversed(messages):
+        content = message.get("content", "")
+        if (
+            message.get("role") == "user"
+            and isinstance(content, str)
+            and len(content) > 100
+            and _requests_continuation(content)
+        ):
+            return content
+    return request
 
 
 def _no_op_retry_plan(plan: PlanSpec) -> bool:
@@ -104,7 +131,7 @@ def _upgrade_generic_plan(project_root: Path, plan: PlanSpec) -> PlanSpec:
         or plan.intent not in {"implement", "fix", "refactor"}
         or len(plan.steps) != 4
         or plan.steps[1].title != "Implement the requested work"
-        or any(item.get("ok") and item.get("name") in {"write_safe_file", "replace_in_file"} for item in plan.tool_history)
+        or any(item.get("ok") and item.get("name") in {"write_safe_file", "replace_in_file", "edit_file_lines"} for item in plan.tool_history)
         or len(_feature_requirements(plan.request)) < 2
     ):
         return plan
@@ -119,8 +146,12 @@ def _upgrade_generic_plan(project_root: Path, plan: PlanSpec) -> PlanSpec:
 
 def _intent(request: str) -> str:
     lowered = request.lower()
+    if _DELETION_RE.search(request):
+        return "delete"
+    if re.search(r"\b(?:tell me|what is)\b", lowered) and _CODE_CHECK_RE.search(request):
+        return "review"
     for name, words in _INTENTS:
-        if any(word in lowered for word in words):
+        if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in words):
             return name
     return "general task"
 
@@ -155,7 +186,14 @@ def parse_request(project_root: Path, request: str, *, session_id: str | None = 
         constraints.append("Inspect referenced files before modifying them.")
     if intent in {"implement", "fix", "refactor"}:
         steps = _implementation_steps(request, sources)
-    elif intent == "test" and _CODE_CHECK_RE.search(request):
+    elif intent == "delete":
+        steps = [
+            PlanStep("step-01", "Inspect deletion scope", "Identify exact target and dependent files/tests before deleting."),
+            PlanStep("step-02", "Delete the requested target", "Run the approved deletion command only for the target."),
+            PlanStep("step-03", "Verify cleanup", "Confirm target absence, inspect Git status, and run the full project tests."),
+            PlanStep("step-04", "Summarize and hand off", "Report verified results and remaining references or failures."),
+        ]
+    elif intent == "test" and (_CODE_CHECK_RE.search(request) or _VERIFY_FOLLOWUP_RE.match(request)):
         steps = [
             PlanStep("step-01", "Inspect relevant context", "Read the relevant files and existing tests.", sources=sources),
             PlanStep("step-02", "Run relevant checks", "Run source checks or tests and resolve failures before claiming success."),
@@ -180,7 +218,9 @@ def parse_request(project_root: Path, request: str, *, session_id: str | None = 
     )
 
 
-def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
+def planning_context(
+    plan: PlanSpec, previous_context: str = "", *, latest_instruction: str = ""
+) -> str:
     """Build verified plan context; legacy previous_context is intentionally ignored."""
     completed = sum(step.status == "complete" for step in plan.steps)
     pending = plan.next_pending()
@@ -206,7 +246,43 @@ def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
         f"- {step.id}: {bounded(step.title, 100)}"
         for step in plan.steps if step.status != "complete"
     ) or "- None."
-    error_section = f"Last error: {bounded(plan.last_error, 300)}\n" if plan.last_error else ""
+    failures_section = "".join(
+        f"- {item['name']} {bounded(item['target'], 100)}: "
+        f"{bounded(item.get('diagnostic') or item.get('outcome'), 100)}\n"
+        for item in plan.unresolved_failures[-4:]
+    )
+    if failures_section:
+        failures_section = "Unresolved checks (retry with corrected inputs):\n" + failures_section
+    error_section = (
+        f"Last error: {bounded(plan.last_error, 300)}\n"
+        if plan.last_error and not plan.last_error.startswith("Wallace has not verified this request as complete.")
+        else ""
+    )
+    instruction_section = (
+        "Latest detailed user instruction (overrides the original request where they conflict):\n"
+        f"{bounded(latest_instruction, 1_200)}\n"
+        if latest_instruction and latest_instruction != plan.request else ""
+    )
+    deletion_section = ""
+    if plan.intent == "delete":
+        target = plan.steps[1].tool_args.get("_deletion_target") if len(plan.steps) > 1 else None
+        checked_path = shlex.quote(str(target)) if target else "<relative-target>"
+        deletion_section = (
+            "Deletion verification: after removing the exact target, run "
+            f"`test ! -e {checked_path}` with execute_command, "
+            "then get_git_status and run_tests with test_path='.'. "
+            "Check remaining references before claiming no trace remains.\n"
+        )
+    elif _DELETION_RE.search(plan.request) and any(
+        item.get("ok") and item.get("name") == "execute_command"
+        and re.match(r"^(?:rm|rmdir|unlink)\b", str(item.get("target", "")))
+        for item in plan.tool_history
+    ):
+        deletion_section = (
+            "A removal command already ran. Do not remove the target again. "
+            "The next action is to verify absence and run `run_tests` with "
+            "test_path='.'; report any real failures.\n"
+        )
     if plan.status == "active" and response_quality_error(plan.summary):
         error_section += (
             "Host note: The previous assistant reply was repetitive and did not "
@@ -216,6 +292,7 @@ def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
     return (
         "Use this durable execution plan as the compact working memory for the "
         "current request. Do not repeat completed work.\n"
+        f"{instruction_section}"
         f"Plan: {plan.plan_id} ({completed}/{len(plan.steps)} complete)\n"
         f"Original request: {bounded(plan.request, 600)}\n"
         f"Intent: {plan.intent}\n"
@@ -228,7 +305,9 @@ def planning_context(plan: PlanSpec, previous_context: str = "") -> str:
         "unchanged failed commands):\n"
         f"{tool_section}\n"
         f"{unchecked_section}"
+        f"{failures_section}"
         f"{error_section}"
+        f"{deletion_section}"
         "The plan state above is supplied by the host. Do not try to read private "
         "Wallace state with project file tools.\n"
     )
@@ -266,16 +345,37 @@ def resume_or_create(project_root: Path, request: str, *, session_id: str | None
         if plan.request == normalized and not _no_op_retry_plan(plan)
     ]
     if matching:
-        return _upgrade_generic_plan(project_root, max(matching, key=lambda plan: plan.updated_at))
+        return _prepare_resumed_plan(project_root, max(matching, key=lambda plan: plan.updated_at))
     if _requests_continuation(normalized) and session_plans:
         # Older releases stored terse retries as completed one-step plans.
         # Ignore those no-op records so a later "continue" can still recover
-        # the unfinished substantive task in the same thread.
+        # the unfinished substantive task in the same thread. A later
+        # verification-only response must not bury the active work plan.
         substantive = [plan for plan in session_plans if not _no_op_retry_plan(plan)]
         latest = max(substantive or session_plans, key=lambda plan: plan.updated_at)
-        if latest.status == "active":
-            return _upgrade_generic_plan(project_root, latest)
+        unfinished = [
+            plan for plan in candidates
+            if not _no_op_retry_plan(plan) and not _VERIFY_FOLLOWUP_RE.match(plan.request)
+        ]
+        if unfinished and (
+            latest.status == "active" or _VERIFY_FOLLOWUP_RE.match(latest.request)
+        ):
+            return _prepare_resumed_plan(project_root, max(unfinished, key=lambda plan: plan.updated_at))
     return parse_request(project_root, request, session_id=session_id)
+
+
+def _prepare_resumed_plan(project_root: Path, plan: PlanSpec) -> PlanSpec:
+    """Drop historical tool-invocation typos, not genuine failed checks."""
+    plan = _upgrade_generic_plan(project_root, plan)
+    invalid = [
+        item for item in plan.unresolved_failures
+        if item.get("name") == "check_python_syntax"
+        and Path(str(item.get("target", ""))).suffix != ".py"
+    ]
+    if invalid:
+        plan.record_progress([])
+        save_plan(project_root, plan)
+    return plan
 
 
 def add_planning_arguments(parser) -> None:

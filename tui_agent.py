@@ -3,7 +3,8 @@
 Run with:  python tui_agent.py
 Keys:      Enter = send, Esc = cancel current request, Ctrl+L = clear log, Ctrl+Q = quit
            Select chat text with the mouse and press Ctrl+C; Input supports Ctrl+C/Ctrl+V.
-Threads:   /threads, /new [title], /switch <id or title>, /rename <title>, /remove <id or title>, /clear
+Threads:   /threads, /new [--trust MODE] [title], /trust [MODE], /switch, /rename, /remove, /clear
+Editor:    F5 or /edit [relative path] opens a safe workspace file in Neovim/Vim
 Themes:    F9 or /theme to choose; /theme <name> to apply directly
 Models:    F10 or /model to list; /model <name> to switch; /key opens masked entry
 MCP:       F11 or /mcp to list; /mcp add|remove|on|off|reload to manage
@@ -11,10 +12,14 @@ Approvals: y = approve, n / Esc = reject (when the agent wants to run a command 
 """
 
 import asyncio
+import math
 import os
 import re
 import shlex
+import shutil
+import subprocess
 import tempfile
+import time
 from datetime import datetime
 from fnmatch import fnmatch
 from functools import partial
@@ -25,7 +30,7 @@ from rich.segment import Segment
 from rich.style import Style
 from rich.text import Span, Text
 from textual import work
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, SuspendNotSupported
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
@@ -37,9 +42,11 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    OptionList,
     RichLog,
     Static,
 )
+from textual.widgets.option_list import Option
 
 from main import (
     CLOUD_KEY_WARNING,
@@ -63,6 +70,7 @@ from main import (
     new_thread_config,
     no_text_status,
     RepetitiveResponseError,
+    recover_pending_full_suite,
     response_quality_error,
     resume_command,
     setup_agent,
@@ -94,9 +102,13 @@ from wallace_models import (
 from wallace_planning import (
     ArchiveManager,
     ConversationThreadManager,
+    TRUST_MODES,
+    continuation_instruction,
+    parse_new_thread_arguments,
     planning_context,
     resume_or_create,
     save_plan,
+    validate_trust_mode,
 )
 from wallace_sky import sky_icons
 from wallace_themes import (
@@ -487,7 +499,7 @@ class ThreadPanel(Vertical):
         yield Static("THREADS", id="thread_title")
         with VerticalScroll(id="thread_list_scroll"):
             yield Static(id="thread_list")
-        yield Static("/new  /switch  /rename  /remove", id="thread_hint")
+        yield Static("/new  /switch  /trust  /edit", id="thread_hint")
 
     def refresh_threads(self, manager: ConversationThreadManager, current_id: str) -> None:
         text = Text()
@@ -502,7 +514,7 @@ class ThreadPanel(Vertical):
                 else ""
             )
             text.append(f"{marker}{record.title}\n", style=style)
-            text.append(f"   {record.thread_id}\n", style=WALLACE_THEME["muted"])
+            text.append(f"   {record.thread_id} · {record.trust_mode}\n", style=WALLACE_THEME["muted"])
         self.query_one("#thread_list", Static).update(text)
 
 
@@ -671,9 +683,13 @@ class ApprovalScreen(ModalScreen[bool]):
         ("escape", "reject", "Reject"),
     ]
 
-    def __init__(self, detail: str) -> None:
+    def __init__(self, detail: str, *, countdown_seconds: float | None = None) -> None:
         super().__init__()
         self.detail = detail
+        self.countdown_seconds = countdown_seconds
+        self._deadline: float | None = None
+        self._countdown_paused = False
+        self._countdown_timer = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -685,6 +701,50 @@ class ApprovalScreen(ModalScreen[bool]):
                 yield Button("No (N)", variant="error", id="reject")
                 yield Button("Yes (Y)", variant="success", id="approve")
 
+    def on_mount(self) -> None:
+        if self.countdown_seconds is not None:
+            self._deadline = time.monotonic() + self.countdown_seconds
+            self._update_countdown()
+            self._countdown_timer = self.set_interval(0.1, self._update_countdown)
+
+    def _update_countdown(self) -> None:
+        if self._deadline is None or self._countdown_paused:
+            return
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            if self._countdown_timer is not None:
+                self._countdown_timer.stop()
+            self.dismiss(True)
+            return
+        self.query_one("#approval_hint", Static).update(
+            f"Auto-approve in {math.ceil(remaining)}s · move mouse or press a key to pause · Y/N"
+        )
+
+    def _pause_countdown(self) -> None:
+        if self._deadline is None or self._countdown_paused:
+            return
+        self._countdown_paused = True
+        if self._countdown_timer is not None:
+            self._countdown_timer.stop()
+        self.query_one("#approval_hint", Static).update(
+            "Countdown paused. Read the action, then press Y = Yes or N = No (Esc = No)."
+        )
+
+    def on_mouse_move(self, event) -> None:
+        self._pause_countdown()
+
+    def on_mouse_down(self, event) -> None:
+        self._pause_countdown()
+
+    def on_mouse_scroll_up(self, event) -> None:
+        self._pause_countdown()
+
+    def on_mouse_scroll_down(self, event) -> None:
+        self._pause_countdown()
+
+    def on_key(self, event: Key) -> None:
+        self._pause_countdown()
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "approve")
 
@@ -693,6 +753,68 @@ class ApprovalScreen(ModalScreen[bool]):
 
     def action_reject(self) -> None:
         self.dismiss(False)
+
+
+class WorkspaceFileScreen(ModalScreen[str | None]):
+    """User-only, searchable picker for an existing non-sensitive workspace file."""
+
+    DEFAULT_CSS = """
+    WorkspaceFileScreen { align: center middle; }
+    #file_dialog {
+        width: 85%; max-width: 100; height: 80%;
+        border: thick $primary; background: $surface; padding: 1 2;
+    }
+    #file_title { height: 1; text-style: bold; margin-bottom: 1; }
+    #file_search { height: 3; }
+    #file_options { height: 1fr; }
+    #file_hint { height: auto; color: $text-muted; margin-top: 1; }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__()
+        self.paths = paths
+        self._matches = paths[:100]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="file_dialog"):
+            yield Static("Edit a workspace file", id="file_title")
+            yield Input(placeholder="Filter by filename or path", id="file_search")
+            yield OptionList(*(Option(path, id=path) for path in self._matches), id="file_options")
+            yield Static(
+                "Enter opens the first match; ↓ selects a result. Esc cancels. "
+                "Private files are excluded.",
+                id="file_hint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#file_search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "file_search":
+            return
+        query = event.value.casefold().strip()
+        self._matches = [path for path in self.paths if query in path.casefold()][:100]
+        options = self.query_one("#file_options", OptionList)
+        options.clear_options()
+        options.add_options(Option(path, id=path) for path in self._matches)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        if self._matches:
+            self.dismiss(self._matches[0])
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(event.option.id)
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "down" and self.query_one("#file_search", Input).has_focus:
+            self.query_one("#file_options", OptionList).focus()
+            event.stop()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class CloudKeyScreen(ModalScreen[str | None]):
@@ -877,6 +999,7 @@ class AgentTUI(App):
         ("ctrl+q", "quit", "Quit"),
         ("ctrl+l", "clear_log", "Clear"),
         ("ctrl+t", "toggle_threads", "Threads"),
+        ("f5", "edit_file", "Edit file"),
         ("f6", "toggle_workspace", "Workspace"),
         Binding("f7", "narrow_workspace", "Narrow workspace", show=False),
         Binding("f8", "widen_workspace", "Widen workspace", show=False),
@@ -982,8 +1105,10 @@ class AgentTUI(App):
         self.set_interval(0.35, self._advance_thinking_status)
         self._write_chat_block(Text("Welcome to Wallace.", style=f"bold {WALLACE_THEME['success']}"))
         self._write_chat_block(
-            f"Thread: {self.thread_id}. /threads /new /switch /rename /remove /clear /theme /model /mcp"
+            f"Thread: {self.thread_id} · trust: {self.thread_manager.resolve(self.thread_id).trust_mode}. "
+            "/threads /new /switch /trust /edit /rename /remove /clear /theme /model /mcp"
         )
+        self._announce_trust_risk(self.thread_manager.resolve(self.thread_id).trust_mode)
         self._restore_conversation()
         if pending_prompt:
             self._write_chat_block(
@@ -1003,6 +1128,18 @@ class AgentTUI(App):
         if self.chat_log._theme_entries:
             self.chat_log.write("")
         self.chat_log.write(content)
+
+    def _announce_trust_risk(self, mode: str) -> None:
+        if mode == "informed-trust":
+            self._write_chat_block(Text(
+                "Informed-trust: approval-required actions auto-run after 10 seconds unless you interact with the preview.",
+                style=WALLACE_THEME["warning"],
+            ))
+        elif mode == "yes-trust":
+            self._write_chat_block(Text(
+                "Yes-trust: approval-required actions run without prompts, including commands that can access files under your OS account.",
+                style=WALLACE_THEME["warning"],
+            ))
 
     def _user_chat_line(self, content: str) -> Text:
         line = Text()
@@ -1348,7 +1485,12 @@ class AgentTUI(App):
             self._active_plan = resume_or_create(
                 SAFE_ROOT, prompt, session_id=self.thread_id
             )
-            agent_prompt = planning_context(self._active_plan) + "\nUser request:\n" + prompt
+            agent_prompt = planning_context(
+                self._active_plan,
+                latest_instruction=continuation_instruction(
+                    prompt, self.conversation_store.load_all()
+                ),
+            ) + "\nUser request:\n" + prompt
             self._write_chat_block(
                 Text(
                     f"Plan {self._active_plan.plan_id}: "
@@ -1541,8 +1683,25 @@ class AgentTUI(App):
                 self._set_thinking_status(rotate=True)
                 payload = resume_command(decisions)
 
+            activity = model_tool_activity(turn_messages)
+            async def approve_host_check(request: dict) -> bool:
+                self._set_thinking_status(rotate=False, message="Waiting for test approval")
+                approved = await self._ask_approval(request)
+                if approved:
+                    self._set_thinking_status(rotate=True, message="Running full test suite")
+                return approved
+
+            host_check = await recover_pending_full_suite(
+                self._active_plan, activity, approve_host_check
+            )
+            if host_check is not None:
+                verification, observed = host_check
+                activity.extend(observed)
+                # The model has not seen this newly observed result, so its
+                # earlier completion claim cannot be the final report.
+                response = verification
+
             if response is None:
-                activity = model_tool_activity(turn_messages)
                 if self._active_plan is not None:
                     self._active_plan.record_progress(
                         activity,
@@ -1578,7 +1737,7 @@ class AgentTUI(App):
                     raise RepetitiveResponseError(quality_error)
                 if self._active_plan is not None:
                     response = verified_plan_response(
-                        self._active_plan, response, model_tool_activity(turn_messages)
+                        self._active_plan, response, activity
                     )
                     save_plan(SAFE_ROOT, self._active_plan)
                     self.thread_manager.touch(self.thread_id)
@@ -1621,12 +1780,21 @@ class AgentTUI(App):
             self._set_busy(False)
 
     async def _ask_approval(self, request: dict) -> bool:
+        mode = self.thread_manager.resolve(self.thread_id).trust_mode
+        if mode == "yes-trust":
+            self.chat_log.write(Text(
+                "  Auto-approved by yes-trust mode.", style=WALLACE_THEME["warning"]
+            ))
+            return True
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         detail = self.credentials.redact(format_action_request(request))
         if parse_model_selection(self.model_name)[0] != "ollama":
             detail = f"{CLOUD_TOOL_WARNING}\n\n{detail}"
         self.push_screen(
-            ApprovalScreen(detail),
+            ApprovalScreen(
+                detail,
+                countdown_seconds=10 if mode == "informed-trust" else None,
+            ),
             lambda result: future.done() or future.set_result(bool(result)),
         )
         return await future
@@ -1716,7 +1884,11 @@ class AgentTUI(App):
         self._active_plan = None
         self.thread_config = new_thread_config()
         self.chat_log.clear()
-        self._write_chat_block(Text(f"Thread: {record.thread_id} — {record.title}", style=WALLACE_THEME["success"]))
+        self._write_chat_block(Text(
+            f"Thread: {record.thread_id} — {record.title} · trust: {record.trust_mode}",
+            style=WALLACE_THEME["success"],
+        ))
+        self._announce_trust_risk(record.trust_mode)
         self._restore_conversation()
         if self.conversation_store.load_pending():
             self._write_chat_block(Text("This thread has an interrupted request; send it again to resume.", style=WALLACE_THEME["warning"]))
@@ -1731,6 +1903,8 @@ class AgentTUI(App):
             return
         action = parts[0].lower()
         try:
+            if self._busy and action in {"/new", "/switch", "/rename", "/remove", "/delete", "/trust", "/edit"}:
+                raise ValueError("finish or cancel the current request before changing threads or editing files")
             if action == "/key":
                 if len(parts) != 1:
                     self._write_warning("Use /key with no argument; enter the secret in the masked dialog.")
@@ -1784,10 +1958,41 @@ class AgentTUI(App):
                 self.chat_log.write(Text("Conversation threads:", style=WALLACE_THEME["primary"]))
                 for record in self.thread_manager.list_threads():
                     marker = "*" if record.thread_id == self.thread_id else " "
-                    self.chat_log.write(f"{marker} {record.thread_id}: {record.title}")
+                    self.chat_log.write(f"{marker} {record.thread_id}: {record.title} [{record.trust_mode}]")
             elif action == "/new":
-                record = self.thread_manager.create(" ".join(parts[1:]) or None)
+                title, trust_mode = parse_new_thread_arguments(parts[1:])
+                record = self.thread_manager.create(title, trust_mode=trust_mode)
                 self._switch_thread(record.thread_id)
+            elif action == "/trust":
+                if len(parts) == 1:
+                    current = self.thread_manager.resolve(self.thread_id).trust_mode
+                    self._write_chat_block(
+                        f"Trust: {current}. Modes: {', '.join(TRUST_MODES)}. "
+                        "Use /trust <mode> to change this thread."
+                    )
+                elif len(parts) == 2:
+                    record = self.thread_manager.set_trust_mode(
+                        self.thread_id, validate_trust_mode(parts[1])
+                    )
+                    self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
+                    self._write_chat_block(Text(
+                        f"Trust mode for {record.title}: {record.trust_mode}. "
+                        + (
+                            "Approval-required tools now run without a prompt; they can modify files and access your OS account."
+                            if record.trust_mode == "yes-trust" else
+                            "Approval-required tools auto-run after 10 seconds unless you interact with the dialog."
+                            if record.trust_mode == "informed-trust" else
+                            "Approval-required tools need Y/N confirmation."
+                        ),
+                        style=WALLACE_THEME["warning"],
+                    ))
+                else:
+                    raise ValueError("use /trust [no-trust|informed-trust|yes-trust]")
+            elif action == "/edit":
+                if len(parts) == 1:
+                    self.action_edit_file()
+                else:
+                    self._open_workspace_editor(" ".join(parts[1:]))
             elif action == "/switch" and len(parts) >= 2:
                 record = self.thread_manager.resolve(" ".join(parts[1:]))
                 self._switch_thread(record.thread_id)
@@ -1808,7 +2013,7 @@ class AgentTUI(App):
             elif action == "/clear":
                 self.action_clear_log()
             else:
-                self._write_warning("Commands: /threads, /new [title], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /key")
+                self._write_warning("Commands: /threads, /new [--trust MODE] [title], /trust [MODE], /edit [path], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /key")
         except (OSError, ValueError) as error:
             self._write_warning(f"Thread command failed: {error}")
 
@@ -1820,6 +2025,45 @@ class AgentTUI(App):
         self.chat_log.write(
             Text("Conversation history cleared.", style=WALLACE_THEME["success"])
         )
+
+    def action_edit_file(self) -> None:
+        if self._busy:
+            self._write_warning("Finish or cancel the current request before editing a file.")
+            return
+        paths = sorted(_workspace_file_state(), key=str.casefold)
+        if not paths:
+            self._write_warning("No editable workspace files were found.")
+            return
+        self.push_screen(
+            WorkspaceFileScreen(paths),
+            lambda path: self._open_workspace_editor(path) if path else None,
+        )
+
+    def _open_workspace_editor(self, relative_path: str) -> None:
+        if self._busy:
+            self._write_warning("Finish or cancel the current request before editing a file.")
+            return
+        path = (SAFE_ROOT / relative_path).resolve()
+        if not path.is_file() or not _allowed_workspace_path(path):
+            self._write_warning("Choose an existing, non-sensitive file inside the workspace.")
+            return
+        editor = shutil.which("nvim") or shutil.which("vim") or shutil.which("vi")
+        if editor is None:
+            self._write_warning("Neovim, Vim, or vi is needed for /edit.")
+            return
+        self._set_busy(True)
+        try:
+            with self.suspend():
+                result = subprocess.run([editor, "--", str(path)], cwd=SAFE_ROOT, check=False)
+            self.workspace_panel.refresh_view(f"Edited {path.relative_to(SAFE_ROOT)}")
+            if result.returncode == 0:
+                self._write_chat_block(f"Editor closed: {path.relative_to(SAFE_ROOT)}")
+            else:
+                self._write_warning(f"Editor exited with status {result.returncode}.")
+        except (OSError, RuntimeError, SuspendNotSupported) as error:
+            self._write_warning(f"Could not open editor: {error}")
+        finally:
+            self._set_busy(False)
 
     def _refresh_workspace(self) -> None:
         if self.workspace_panel is not None and self.workspace_panel.query("#workspace_tree"):

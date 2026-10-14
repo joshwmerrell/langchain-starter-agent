@@ -2,11 +2,14 @@ import asyncio
 import argparse
 import getpass
 import json
+import math
 import os
 import re
+import select
 import shlex
 import sys
 import tempfile
+import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable, Sequence
@@ -31,6 +34,13 @@ from rich.panel import Panel
 from rich.text import Text
 
 try:
+    import termios
+    import tty
+except ImportError:  # Windows has no termios; informed-trust stays fail-closed there.
+    termios = None
+    tty = None
+
+try:
     # Built into LangChain (beta); install with: uv add "langchain[mcp]"
     from langchain.mcp import MCPAdapter
     _MCP_IMPORT_ERROR = None
@@ -38,7 +48,10 @@ except ImportError as _error:
     MCPAdapter = None
     _MCP_IMPORT_ERROR = _error
 
-from tools import TOOLS, TOOLS_REQUIRING_APPROVAL, preview_write
+from tools import (
+    MAX_OUTPUT_CHARS, TEST_TIMEOUT, TOOLS, TOOLS_REQUIRING_APPROVAL,
+    _tool_environment, _truncate_middle, preview_line_edit, preview_write,
+)
 from wallace_mcp import (
     BUILTIN_NAME,
     BUILTIN_URL,
@@ -58,10 +71,14 @@ from wallace_tool_selection import select_tools
 from wallace_planning import (
     ArchiveManager,
     ConversationThreadManager,
+    TRUST_MODES,
+    continuation_instruction,
+    parse_new_thread_arguments,
     planning_context,
     response_quality_error,
     resume_or_create,
     save_plan,
+    validate_trust_mode,
 )
 from wallace_models import (
     CloudCredentials,
@@ -194,7 +211,8 @@ MALFORMED_TOOL_CALL_RETRY_PROMPT = (
     "Continue from the completed tool results already in this turn; do not "
     "repeat a successful call. The last tool arguments were malformed JSON. "
     "If a tool is still needed, make one small valid call. Use replace_in_file "
-    "for small edits and write_safe_file only for short new files."
+    "for small edits; if its anchor fails, re-read and use edit_file_lines. "
+    "Use write_safe_file only for short new files."
 )
 
 EMPTY_RESPONSE_RETRY_PROMPT = (
@@ -288,9 +306,11 @@ Work efficiently:
   `analyze_project_dependencies`, and `analyze_git_change_impact` to inspect
   imports, dependents, and likely change impact.
 - Change existing files with `replace_in_file` (copy old_text exactly from the
-  file). Use `write_safe_file` only for short new files, not for changes to
-  existing files. Keep each edit small enough that the full tool arguments can
-  fit comfortably in the model output budget.
+  file). If the exact anchor fails, re-read the current range and use
+  `edit_file_lines` with its current line numbers; avoid shell commands for
+  ordinary text edits. Use `execute_command` for deletions or moves. Use
+  `write_safe_file` only for short new files. Keep edits small enough that
+  the full tool arguments fit the model output budget.
 - After editing Python, run `check_python_syntax`, and `run_tests` if the
   project has tests. File-edit tools reject Python that fails compilation;
   an `Error:` result means the file was not changed. Correct the edit before
@@ -332,9 +352,16 @@ choice genuinely blocks safe progress. The host supplies plan state directly;
 do not try to open private plan files with project tools. Finish the current
 request with a concise text summary after tool work.
 
-Shell, file-edit, test, source-check, tool-contract, and configured MCP calls
-need the user's approval before they run. If the user rejects an action, do not retry it;
-briefly say what you did not do and ask how they would like to proceed.
+The host applies the current thread's user-selected approval mode to shell,
+file-edit, test, source-check, tool-contract, and configured MCP calls. Only
+the user may change this mode via host commands; do not attempt to edit private
+thread state with project tools. If an action is rejected, do not retry it;
+briefly say what you did not do and ask how the user would like to proceed.
+For deletion requests, verify the exact target is gone, inspect Git status and
+remaining references, and run relevant tests before claiming completion.
+Deleting working-tree files does not remove their contents from Git history.
+Never describe a project as fully tested or production-ready based only on a
+directory listing.
 """
 
 
@@ -721,7 +748,7 @@ def no_text_status(plan, activity: list[dict[str, object]]) -> str:
             f"Last observed tool: {last['name']} ({last['outcome']})."
         )
     if not any(
-        item.get("ok") and item.get("name") in {"replace_in_file", "write_safe_file"}
+        item.get("ok") and item.get("name") in {"replace_in_file", "edit_file_lines", "write_safe_file"}
         for item in activity
     ):
         parts.append("No file edit was observed in this turn.")
@@ -740,13 +767,28 @@ _assistant_response_text = assistant_response_text
 
 def _safe_tool_diagnostic(name: str, output: str) -> str:
     """Keep only a useful error category, never returned source or command output."""
+    if name == "run_tests":
+        if "NO TESTS RAN" in output or "Ran 0 tests" in output:
+            return "no tests were discovered; check the test directory"
+        if "Command timed out" in output:
+            return "test run timed out"
+        summary = re.search(r"FAILED \((?:failures|errors)=\d+[^)]*\)", output)
+        if summary:
+            return summary.group(0)
     if name == "replace_in_file":
         if "old_text was not found" in output:
-            return "replacement anchor not found; re-read the file"
+            return "replacement anchor not found; re-read or use edit_file_lines"
         if re.search(r"old_text matches \d+ places", output):
             return "replacement anchor is not unique"
         if "old_text and new_text are identical" in output:
             return "replacement makes no change"
+    if name == "edit_file_lines":
+        if "line range is invalid" in output:
+            return "line range is stale or invalid; re-read the file"
+        if "edit spans more than" in output:
+            return "line edit is too large; use smaller ranges"
+        if "edit makes no change" in output:
+            return "line edit makes no change"
     if "not installed" in output:
         return "required checker is not installed"
     if re.search(r"(?:SyntaxError|syntax error|parse error)", output, re.IGNORECASE):
@@ -799,11 +841,18 @@ def model_tool_activity(messages: Sequence[BaseMessage]) -> list[dict[str, objec
             target = str(args["path"])[:160]
         elif "test_path" in args:
             target = str(args["test_path"])[:160]
+        elif name == "run_tests":
+            target = "."
         elif "tool_name" in args:
             target = str(args["tool_name"])[:160]
         else:
             target = ""
         output = str(message.content).strip()
+        if (
+            name == "check_python_syntax" and target
+            and not Path(target).suffix and output.startswith("OK: ")
+        ):
+            target += ".py"
         exit_match = re.match(r"Exit code:\s*(\d+)", output)
         failed = tool_result_failed(output, getattr(message, "status", None))
         # Never persist returned file text or command output in the plan.
@@ -833,6 +882,98 @@ def verified_plan_response(plan, response: str, activity: list[dict[str, object]
     plan.summary = handoff
     plan.last_error = handoff
     return handoff
+
+
+async def _run_host_full_suite() -> str:
+    """Run the existing test tool in a subprocess without freezing the TUI."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "from tools import run_tests; print(run_tests.invoke({'test_path': '.'}))",
+            cwd=str(Path(__file__).resolve().parent),
+            env=_tool_environment(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(), timeout=TEST_TIMEOUT + 30
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return "Error: full-suite host runner timed out."
+    except OSError:
+        return "Error: full-suite host runner could not start."
+    output = stdout.decode("utf-8", errors="replace").strip()
+    if not output.startswith(("Exit code:", "Error:")):
+        return f"Error: full-suite host runner failed (exit code {process.returncode})."
+    return _truncate_middle(output, MAX_OUTPUT_CHARS)
+
+
+async def recover_pending_full_suite(
+    plan,
+    activity: list[dict[str, object]],
+    ask_approval: Callable[[dict], Awaitable[bool]],
+) -> tuple[str, list[dict[str, object]]] | None:
+    """With normal approval, run a full suite a model repeatedly skipped.
+
+    This only applies to a resumed validation step with an existing failed
+    full-suite invocation. A new run is never silently substituted for a
+    model's failed check or an unrelated user request.
+    """
+    if (
+        plan is None
+        or plan.next_pending() is None
+        or plan.next_pending().title != "Run relevant checks"
+        or not any(
+            item.get("name") == "run_tests" and item.get("target") in {"", ".", "tests"}
+            for item in plan.unresolved_failures
+        )
+        or any(item.get("name") != "run_tests" for item in plan.unresolved_failures)
+        or any(
+            item.get("name") == "run_tests"
+            and item.get("target") in {"", ".", "tests"}
+            for item in activity
+        )
+    ):
+        return None
+    request = {"name": "run_tests", "args": {"test_path": "."}}
+    if not await ask_approval(request):
+        return "Full-suite test run was not approved; verification remains unfinished.", []
+    output = await _run_host_full_suite()
+    call_id = f"host-suite-{uuid.uuid4().hex}"
+    observed = model_tool_activity([
+        AIMessage(content="", tool_calls=[{
+            "id": call_id, "name": "run_tests", "args": {"test_path": "."},
+        }]),
+        ToolMessage(content=output, tool_call_id=call_id, name="run_tests"),
+    ])
+    event = observed[0]
+    if event["ok"]:
+        count = re.search(r"Ran (\d+) tests?\b", output)
+        summary = (
+            f"Full project tests passed ({count.group(1)} tests)."
+            if count else "Full project tests passed (exit code 0)."
+        )
+    else:
+        detail = event.get("diagnostic") or event.get("outcome") or "failed"
+        summary = f"Full project tests did not pass ({detail})."
+    if re.search(r"\btest[-_]site\b", str(plan.request), re.IGNORECASE):
+        site = Path(__file__).resolve().parent / "test_site"
+        absent = not site.exists()
+        observed.append({
+            "id": f"host-absence-{uuid.uuid4().hex}",
+            "name": "host_path_absence_check",
+            "target": "test_site",
+            "outcome": "ok" if absent else "failed",
+            "diagnostic": "" if absent else "directory still exists",
+            "ok": absent,
+        })
+        summary += (
+            " test_site is still present; deletion remains unfinished."
+            if not absent else " test_site is absent."
+        )
+    return summary, observed
 
 
 async def malformed_retry_payload(agent, thread_config, original_prompt: str) -> dict:
@@ -930,6 +1071,16 @@ def format_action_request(request: dict, max_chars: int = 3000) -> str:
         removed = [f"- {line}" for line in str(args.get("old_text", "")).splitlines()]
         added = [f"+ {line}" for line in str(args.get("new_text", "")).splitlines()]
         body = f"Path: {args.get('path', '')}\n\n" + "\n".join(removed + added)
+    elif name == "edit_file_lines":
+        try:
+            body = preview_line_edit(
+                str(args.get("path", "")),
+                int(args.get("start_line", 0)),
+                int(args.get("end_line", 0)),
+                str(args.get("new_text", "")),
+            )
+        except (TypeError, ValueError):
+            body = f"Path: {args.get('path', '')}\n(invalid line range)"
     else:
         body = "\n".join(f"{key}: {value}" for key, value in args.items())
     if len(body) > max_chars:
@@ -1190,7 +1341,12 @@ def _ask_cli_approval(
     request: dict,
     model_name: str | None = None,
     credentials: CloudCredentials | None = None,
+    trust_mode: str = "no-trust",
 ) -> bool:
+    trust_mode = validate_trust_mode(trust_mode)
+    if trust_mode == "yes-trust":
+        console.print("[yellow]Auto-approved by yes-trust mode.[/yellow]")
+        return True
     detail = format_action_request(request)
     if credentials is not None:
         detail = credentials.redact(detail)
@@ -1203,6 +1359,35 @@ def _ask_cli_approval(
             border_style="yellow",
         )
     )
+    if trust_mode == "informed-trust":
+        if not sys.stdin.isatty() or termios is None or tty is None:
+            console.print("[yellow]Interactive countdown unavailable; action rejected.[/yellow]")
+            return False
+        descriptor = sys.stdin.fileno()
+        original = termios.tcgetattr(descriptor)
+        deadline = time.monotonic() + 10
+        choice = None
+        try:
+            tty.setcbreak(descriptor)
+            while (remaining := deadline - time.monotonic()) > 0:
+                console.print(
+                    f"[yellow]Auto-approve in {math.ceil(remaining)}s; press any key to pause.[/yellow]",
+                    end="\r",
+                )
+                if select.select([descriptor], [], [], min(1, remaining))[0]:
+                    choice = os.read(descriptor, 1).decode(errors="ignore")
+                    break
+        finally:
+            termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
+            console.print(" " * 65, end="\r")
+        if choice is None:
+            console.print("[yellow]Approved after 10 seconds of no interaction.[/yellow]")
+            return True
+        if choice.lower() == "y":
+            return True
+        if choice.lower() == "n" or choice == "\x1b":
+            return False
+        console.print("[yellow]Countdown paused. Review the action and choose Y or N.[/yellow]")
     return input("Approve? [y/N]: ").strip().lower() in {"y", "yes"}
 
 
@@ -1210,7 +1395,7 @@ def _print_threads(manager: ConversationThreadManager, current_id: str) -> None:
     console.print("[cyan]Conversation threads[/cyan]")
     for record in manager.list_threads():
         marker = "*" if record.thread_id == current_id else " "
-        console.print(f"{marker} {record.thread_id}: {record.title}")
+        console.print(f"{marker} {record.thread_id}: {record.title} ({record.trust_mode})")
 
 
 CLOUD_KEY_WARNING = (
@@ -1275,13 +1460,24 @@ def _handle_thread_command(
         if action in {"/threads", "/thread"}:
             _print_threads(manager, current_id)
         elif action == "/new":
-            record = manager.create(" ".join(parts[1:]) or None)
-            console.print(f"[green]Created thread {record.thread_id}: {record.title}[/green]")
+            title, trust_mode = parse_new_thread_arguments(parts[1:])
+            record = manager.create(title, trust_mode=trust_mode)
+            console.print(f"[green]Created thread {record.thread_id}: {record.title} ({record.trust_mode})[/green]")
             return record.thread_id
         elif action == "/switch" and len(parts) >= 2:
             record = manager.resolve(" ".join(parts[1:]))
-            console.print(f"[green]Switched to {record.thread_id}: {record.title}[/green]")
+            console.print(f"[green]Switched to {record.thread_id}: {record.title} ({record.trust_mode})[/green]")
             return record.thread_id
+        elif action == "/trust":
+            if len(parts) == 1:
+                record = manager.resolve(current_id)
+                console.print(f"[cyan]Trust: {record.trust_mode}. Modes: {', '.join(TRUST_MODES)}.[/cyan]")
+            elif len(parts) == 2:
+                record = manager.set_trust_mode(current_id, parts[1])
+                console.print(f"[yellow]Trust mode for {record.title}: {record.trust_mode}. "
+                              "Higher-trust modes may execute commands and access files without an explicit approval.[/yellow]")
+            else:
+                raise ValueError("use /trust [no-trust|informed-trust|yes-trust]")
         elif action == "/rename" and len(parts) >= 2:
             record = manager.rename(current_id, " ".join(parts[1:]))
             console.print(f"[green]Renamed current thread to: {record.title}[/green]")
@@ -1296,8 +1492,8 @@ def _handle_thread_command(
             console.print("[green]Current thread history cleared.[/green]")
         else:
             console.print(
-                "[yellow]Thread commands: /threads, /new [title], /switch <id or title>, "
-                "/rename <title>, /remove <id or title>, /clear[/yellow]"
+                "[yellow]Thread commands: /threads, /new [--trust MODE] [title], /trust [MODE], "
+                "/switch <id or title>, /rename <title>, /remove <id or title>, /clear[/yellow]"
             )
     except (OSError, ValueError) as error:
         console.print(f"[yellow]Thread command failed: {error}[/yellow]")
@@ -1311,6 +1507,7 @@ async def _invoke_with_approvals(
     *,
     model_name: str | None = None,
     credentials: CloudCredentials | None = None,
+    trust_mode: str = "no-trust",
 ) -> dict:
     """Run one turn, pausing for approval whenever the agent asks for it."""
     payload = {"messages": [{"role": "user", "content": prompt}]}
@@ -1335,7 +1532,7 @@ async def _invoke_with_approvals(
         if not requests:
             return result
         decisions = [
-            make_decision(_ask_cli_approval(request, model_name, credentials))
+            make_decision(_ask_cli_approval(request, model_name, credentials, trust_mode))
             for request in requests
         ]
         payload = resume_command(decisions)
@@ -1348,6 +1545,7 @@ async def run_agent(
     thread_id: str | None = None,
     new_thread: bool = False,
     thread_title: str | None = None,
+    trust_mode: str = "no-trust",
 ) -> None:
     project_root = Path(__file__).resolve().parent
     ArchiveManager(project_root).run_at_session_boundary()
@@ -1355,13 +1553,16 @@ async def run_agent(
     thread_manager = ConversationThreadManager(project_root)
     selected_id = thread_id or session_id or thread_manager.active_thread_id()
     if new_thread:
-        selected_id = thread_manager.create(thread_title).thread_id
+        selected_id = thread_manager.create(thread_title, trust_mode=trust_mode).thread_id
     else:
         selected_id = thread_manager.ensure(selected_id).thread_id
     thread_manager.select_thread(selected_id)
     conversation_store = thread_manager.store(selected_id)
     conversation_history = conversation_store.load()
-    console.print(f"[cyan]Conversation thread: {selected_id}[/cyan]")
+    console.print(
+        f"[cyan]Conversation thread: {selected_id} "
+        f"(trust: {thread_manager.resolve(selected_id).trust_mode})[/cyan]"
+    )
     selected_model = load_model_choice(project_root, OLLAMA_MODEL)
     credentials = CloudCredentials()
     startup_provider, _ = parse_model_selection(selected_model)
@@ -1540,7 +1741,10 @@ async def run_agent(
                 conversation_store = thread_manager.store(selected_id)
                 conversation_history = conversation_store.load()
                 thread_config = new_thread_config()
-                console.print(f"[cyan]Now using conversation thread: {selected_id}[/cyan]")
+                console.print(
+                    f"[cyan]Now using conversation thread: {selected_id} "
+                    f"(trust: {thread_manager.resolve(selected_id).trust_mode})[/cyan]"
+                )
             continue
 
         plan = None
@@ -1558,7 +1762,12 @@ async def run_agent(
                 f"[cyan]Plan {plan.plan_id} ready; next step: "
                 f"{plan.next_pending().title if plan.next_pending() else 'complete'}[/cyan]"
             )
-            agent_prompt = planning_context(plan) + "\nUser request:\n" + prompt
+            agent_prompt = planning_context(
+                plan,
+                latest_instruction=continuation_instruction(
+                    prompt, conversation_store.load_all()
+                ),
+            ) + "\nUser request:\n" + prompt
         except (OSError, ValueError, TypeError) as error:
             console.print(f"[yellow]Planning setup failed; continuing normally: {error}[/yellow]")
 
@@ -1594,6 +1803,7 @@ async def run_agent(
             result = await _invoke_with_approvals(
                 agent, thread_config, agent_prompt,
                 model_name=selected_model, credentials=credentials,
+                trust_mode=thread_manager.resolve(selected_id).trust_mode,
             )
         except Exception as error:
             if plan is not None:
@@ -1620,6 +1830,22 @@ async def run_agent(
             continue
 
         response = assistant_response_text(result.get("messages", []))
+        async def approve_host_suite(request: dict) -> bool:
+            approved = _ask_cli_approval(
+                request, model_name=selected_model, credentials=credentials,
+                trust_mode=thread_manager.resolve(selected_id).trust_mode,
+            )
+            if approved:
+                console.print("[cyan]Running full project tests...[/cyan]")
+            return approved
+
+        host_activity: list[dict[str, object]] = []
+        host_check = await recover_pending_full_suite(
+            plan, model_tool_activity(result.get("messages", [])), approve_host_suite
+        )
+        if host_check is not None:
+            verification, host_activity = host_check
+            response = verification
         if response is None:
             console.print("[yellow]Continuing the unfinished turn once...[/yellow]")
             summary_error = None
@@ -1627,6 +1853,7 @@ async def run_agent(
                 retry_result = await _invoke_with_approvals(
                     agent, thread_config, EMPTY_RESPONSE_RETRY_PROMPT,
                     model_name=selected_model, credentials=credentials,
+                    trust_mode=thread_manager.resolve(selected_id).trust_mode,
                 )
                 response = assistant_response_text(retry_result.get("messages", []))
                 result = {
@@ -1648,7 +1875,7 @@ async def run_agent(
                 activity = model_tool_activity(activity_messages)
                 if plan is not None:
                     plan.record_progress(
-                        activity,
+                        [*activity, *host_activity],
                         error="No final assistant text after one recovery attempt.",
                     )
                 status = no_text_status(plan, activity)
@@ -1682,6 +1909,7 @@ async def run_agent(
                 retry_result = await _invoke_with_approvals(
                     agent, thread_config, clean_response_retry_prompt(prompt),
                     model_name=selected_model, credentials=credentials,
+                    trust_mode=thread_manager.resolve(selected_id).trust_mode,
                 )
                 retry_response = assistant_response_text(retry_result.get("messages", []))
                 if retry_response is not None:
@@ -1699,7 +1927,7 @@ async def run_agent(
         if quality_error is not None:
             if plan is not None:
                 plan.record_progress(
-                    model_tool_activity(result.get("messages", [])),
+                    [*model_tool_activity(result.get("messages", [])), *host_activity],
                     error=quality_error,
                 )
                 save_plan(project_root, plan)
@@ -1709,7 +1937,8 @@ async def run_agent(
 
         if plan is not None:
             response = verified_plan_response(
-                plan, response, model_tool_activity(result.get("messages", []))
+                plan, response,
+                [*model_tool_activity(result.get("messages", [])), *host_activity],
             )
             save_plan(project_root, plan)
 
@@ -1734,9 +1963,12 @@ def main() -> None:
     parser.add_argument("--thread-id", help="Open a specific conversation thread.")
     parser.add_argument("--new-thread", action="store_true", help="Start a new conversation thread.")
     parser.add_argument("--thread-title", help="Title for a new conversation thread.")
+    parser.add_argument("--trust-mode", choices=TRUST_MODES, default="no-trust", help="Trust mode for --new-thread (default: no-trust).")
     args = parser.parse_args()
     if args.thread_id and args.session_id:
         parser.error("use --thread-id or the legacy --session-id, not both")
+    if not args.new_thread and args.trust_mode != "no-trust":
+        parser.error("--trust-mode requires --new-thread; use /trust for an existing thread")
     asyncio.run(
         run_agent(
             use_planning=args.use_planning,
@@ -1744,6 +1976,7 @@ def main() -> None:
             thread_id=args.thread_id,
             new_thread=args.new_thread,
             thread_title=args.thread_title,
+            trust_mode=args.trust_mode,
         )
     )
 
