@@ -23,7 +23,7 @@ TUI_SCRIPT = ROOT / "tui_agent.py"
 STATUS_PATH = ROOT / ".wallace" / "reload_status"
 MCP_CONFIG_PATH = ROOT / ".wallace" / "mcp_servers.json"
 IDLE_SETTLE_SECONDS = 0.75
-WATCH_SKIP_DIRS = {".git", ".wallace", ".venv", "venv", "node_modules", "__pycache__"}
+WATCH_SKIP_DIRS = {".git", ".wallace", ".venv", "venv", "node_modules", "__pycache__", "workspace"}
 
 
 def _write_status(status: str) -> None:
@@ -58,6 +58,7 @@ def _is_busy() -> bool:
 def _start_child() -> subprocess.Popen:
     environment = os.environ.copy()
     environment["WALLACE_RELOAD_STATUS"] = str(STATUS_PATH)
+    environment["WALLACE_DEV_MODE"] = "1"
     _write_status("starting")
     return subprocess.Popen(
         [sys.executable, str(TUI_SCRIPT)],
@@ -138,6 +139,7 @@ def _changes_smoke() -> bool:
         result = subprocess.run(
             [sys.executable, "-c", command],
             cwd=ROOT,
+            env={**os.environ, "WALLACE_DEV_MODE": "1"},
             capture_output=True,
             encoding="utf-8",
             errors="replace",

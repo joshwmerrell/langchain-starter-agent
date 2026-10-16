@@ -1311,6 +1311,7 @@ source = { editable = "." }
 dependencies = [
     { name = "deepagents" },
     { name = "dotenv" },
+    { name = "keyring" },
     { name = "langchain", extra = ["mcp"] },
     { name = "langchain-core" },
     { name = "langchain-google-genai" },
@@ -1328,6 +1329,7 @@ dependencies = [
 requires-dist = [
     { name = "deepagents", specifier = ">=0.7.21" },
     { name = "dotenv", specifier = ">=0.9.9" },
+    { name = "keyring", specifier = ">=25.0.0" },
     { name = "langchain", extras = ["mcp"], specifier = ">=1.4.2" },
     { name = "langchain-core", specifier = ">=1.6.7" },
     { name = "langchain-google-genai", specifier = ">=4.4.0" },

@@ -31,7 +31,7 @@ class ThreadResumeTests(unittest.IsolatedAsyncioTestCase):
     async def test_tui_reopens_the_last_selected_thread(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     first = AgentTUI()
                     async with first.run_test():
@@ -48,16 +48,16 @@ class ThreadResumeTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_restores_selected_thread_without_explicit_flag(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            manager = ConversationThreadManager(root)
+            manager = ConversationThreadManager(root, scope="workspace")
             manager.ensure("main")
             second = manager.create("Second")
             manager.select_thread(second.thread_id)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 with patch("main.setup_agent", new=AsyncMock(return_value=(object(), {}))):
                     with patch("builtins.input", side_effect=["exit"]):
                         with patch("main.console"):
                             await run_agent()
-            self.assertEqual(ConversationThreadManager(root).active_thread_id(), second.thread_id)
+            self.assertEqual(ConversationThreadManager(root, scope="workspace").active_thread_id(), second.thread_id)
 
 
 if __name__ == "__main__":

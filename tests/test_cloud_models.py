@@ -143,7 +143,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_tui_cloud_key_uses_masked_dialog_and_not_chat_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     with patch("tui_agent.setup_agent", new=AsyncMock(return_value=(object(), {}))):
@@ -179,7 +179,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             save_model_choice(root, "gemini:gemini-test")
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 app = AgentTUI()
                 async with app.run_test() as pilot:
                     for _ in range(10):
@@ -198,7 +198,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             save_model_choice(root, "gemini:gemini-test")
             with patch.dict(os.environ, {"GOOGLE_API_KEY": "AIzaTestConfigured"}):
-                with patch("tui_agent.SAFE_ROOT", root):
+                with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                     with patch("tui_agent.setup_agent", new=AsyncMock(return_value=(object(), {}))) as setup:
                         app = AgentTUI()
                         async with app.run_test() as pilot:
@@ -213,7 +213,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tui_cloud_approval_displays_residual_risk_warning(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -230,7 +230,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_cloud_switch_uses_hidden_key_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 with patch("main.setup_agent", new=AsyncMock(return_value=(object(), {}))) as setup:
                     with patch("main.sys.stdin", SimpleNamespace(isatty=lambda: True)):
                         with patch("main.getpass.getpass", return_value="sk-test-cloud-secret") as hidden:
@@ -248,7 +248,7 @@ class CloudModelTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-configured"}):
-                with patch("main.__file__", str(root / "main.py")):
+                with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                     with patch("main.setup_agent", new=AsyncMock(return_value=(object(), {}))) as setup:
                         with patch("main.getpass.getpass", side_effect=AssertionError("unexpected key prompt")):
                             with patch("builtins.input", side_effect=["/model openai:gpt-test", "exit"]):

@@ -52,7 +52,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             save_model_choice(root, "saved:latest")
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 with patch("main._load_docs_tools", new=AsyncMock(return_value=[])):
                     with patch("main.ChatOllama") as model_type:
                         with patch("main.create_agent", return_value=object()):
@@ -71,7 +71,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_tui_switches_live_model_without_losing_thread(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -97,7 +97,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tui_model_command_and_shortcut_are_discoverable(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -113,7 +113,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_tui_rejects_unknown_or_failed_model_without_changing_choice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -132,7 +132,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_model_command_rebuilds_and_remembers_choice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 setup = AsyncMock(side_effect=[(object(), {"old": 1}), (object(), {"new": 1})])
                 with patch("main.setup_agent", new=setup):
                     with patch("main.list_installed_models", new=AsyncMock(return_value=["new:latest"])):
@@ -146,7 +146,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_failed_rebuild_does_not_save_model(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 setup = AsyncMock(side_effect=[(object(), {"old": 1}), RuntimeError("rebuild failed")])
                 with patch("main.setup_agent", new=setup):
                     with patch("main.list_installed_models", new=AsyncMock(return_value=["new:latest"])):
@@ -157,7 +157,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dark_working_text_is_red_and_other_theme_is_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:

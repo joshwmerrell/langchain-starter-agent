@@ -18,6 +18,7 @@ from tools import (
     SAFE_ROOT, _resolve, check_python_syntax, edit_file_lines, preview_line_edit,
     execute_command, read_safe_file, replace_in_file, run_tests, write_safe_file,
 )
+from wallace_runtime import APP_ROOT
 
 
 class CoreSafetyTests(unittest.TestCase):
@@ -193,7 +194,7 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertEqual(trimmed[-1]["role"], "assistant")
 
     def test_dependency_graph_uses_local_package_names(self):
-        graph = DependencyGraph(SAFE_ROOT).build()
+        graph = DependencyGraph(APP_ROOT).build()
         self.assertIn("main", graph.module_paths)
         self.assertIn("tools", graph.module_paths)
         self.assertIn("tools", graph.modules["main"])

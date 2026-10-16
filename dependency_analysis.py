@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from fnmatch import fnmatch
 import re
 import tomllib
 from collections import defaultdict
@@ -139,8 +140,12 @@ class DependencyGraph:
         pattern = "**/*.py" if include_nested else "*.py"
         paths = []
         for path in self.root.glob(pattern):
-            if any(
-                part in {".git", ".venv", "venv", "__pycache__", ".wallace", "node_modules"}
+            if not path.resolve().is_relative_to(self.root.resolve()) or any(
+                part.lower() in {
+                    ".git", ".venv", "venv", "__pycache__", ".wallace",
+                    "node_modules", ".aws", ".ssh", ".gnupg", ".config",
+                    ".codex", ".agents",
+                } or any(fnmatch(part.lower(), pattern) for pattern in (".env", ".env.*", "*.pem", "*.key"))
                 for part in path.relative_to(self.root).parts
             ):
                 continue

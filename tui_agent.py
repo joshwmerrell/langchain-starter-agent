@@ -79,7 +79,12 @@ from main import (
     verified_plan_response,
     tool_result_failed,
 )
-from tools import SAFE_ROOT, SENSITIVE_PATTERNS, SKIP_DIRS
+from tools import (
+    SAFE_ROOT, SENSITIVE_PATTERNS, SKIP_DIRS,
+    reset_active_workspace, set_active_workspace,
+)
+from wallace_runtime import APP_ROOT, DEV_MODE, ensure_workspace, plan_session_id, thread_workspace
+from wallace_keys import add_key, list_keys, parse_key_command, remove_key, set_key_active
 from wallace_mcp import (
     all_mcp_servers,
     apply_mcp_command,
@@ -97,7 +102,7 @@ from wallace_models import (
     list_installed_models,
     parse_model_selection,
     save_model_choice,
-    use_environment_key,
+    use_active_key,
 )
 from wallace_planning import (
     ArchiveManager,
@@ -110,6 +115,7 @@ from wallace_planning import (
     save_plan,
     validate_trust_mode,
 )
+from wallace_status import SessionUsage, StatusContext, bind_status, reset_status
 from wallace_sky import sky_icons
 from wallace_themes import (
     DARK_HEADING_COLOR,
@@ -369,13 +375,14 @@ def _styled_detail(detail: str) -> Text:
     return text
 
 
-def _allowed_workspace_path(path: Path) -> bool:
+def _allowed_workspace_path(path: Path, root: Path | None = None) -> bool:
     """Whether a resolved workspace path is safe to show or track."""
+    root = root or SAFE_ROOT
     try:
-        parts = path.relative_to(SAFE_ROOT).parts
+        parts = path.relative_to(root).parts
     except ValueError:
         return False
-    if any(part in SKIP_DIRS for part in parts):
+    if any(part.lower() in SKIP_DIRS for part in parts):
         return False
     return not any(
         fnmatch(part.lower(), pattern)
@@ -384,33 +391,35 @@ def _allowed_workspace_path(path: Path) -> bool:
     )
 
 
-def _workspace_file_state() -> dict[str, tuple[int, int]]:
+def _workspace_file_state(root: Path | None = None) -> dict[str, tuple[int, int]]:
     """Return safe workspace files mapped to (size, mtime_ns)."""
+    root = root or SAFE_ROOT
     state: dict[str, tuple[int, int]] = {}
-    for root, directories, files in os.walk(SAFE_ROOT):
+    for directory_root, directories, files in os.walk(root):
         directories[:] = sorted(
-            directory for directory in directories if directory not in SKIP_DIRS
+            directory for directory in directories if directory.lower() not in SKIP_DIRS
         )
         for name in files:
-            path = (Path(root) / name).resolve()
-            if not _allowed_workspace_path(path):
+            path = (Path(directory_root) / name).resolve()
+            if not _allowed_workspace_path(path, root):
                 continue
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            relative = path.relative_to(SAFE_ROOT).as_posix()
+            relative = path.relative_to(root).as_posix()
             state[relative] = (stat.st_size, stat.st_mtime_ns)
     return state
 
 
-def _workspace_tree(max_depth: int = 3, max_entries: int = 140) -> Text:
+def _workspace_tree(max_depth: int = 3, max_entries: int = 140, root: Path | None = None) -> Text:
     """Build a bounded, secret-filtered tree for the workspace panel."""
+    root = root or SAFE_ROOT
     text = Text()
     count = 0
 
     def allowed(path: Path) -> bool:
-        return _allowed_workspace_path(path)
+        return _allowed_workspace_path(path, root)
 
     def visit(directory: Path, prefix: str, depth: int) -> None:
         nonlocal count
@@ -438,8 +447,8 @@ def _workspace_tree(max_depth: int = 3, max_entries: int = 140) -> Text:
             else:
                 text.append(f"{prefix}{connector}{entry.name}\n")
 
-    text.append(f"{SAFE_ROOT.name}/\n", style=f"bold {WALLACE_THEME['primary']}")
-    visit(SAFE_ROOT, "", 1)
+    text.append(f"{root.name}/\n", style=f"bold {WALLACE_THEME['primary']}")
+    visit(root, "", 1)
     if count >= max_entries:
         text.append("… tree truncated\n", style=WALLACE_THEME["muted"])
     return text
@@ -450,8 +459,15 @@ class WorkspacePanel(Vertical):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.root = SAFE_ROOT
         self._file_state: dict[str, tuple[int, int]] | None = None
         self._pending_changes: list[str] = []
+
+    def set_root(self, root: Path) -> None:
+        self.root = root
+        self._file_state = None
+        self._pending_changes.clear()
+        self.refresh_view()
 
     def compose(self) -> ComposeResult:
         yield Static("WORKSPACE", id="workspace_title")
@@ -461,7 +477,7 @@ class WorkspacePanel(Vertical):
         yield Static("Waiting for work", id="workspace_activity")
 
     def refresh_view(self, activity: str | None = None) -> list[str]:
-        current_state = _workspace_file_state()
+        current_state = _workspace_file_state(self.root)
         changes: list[str] = []
         if self._file_state is not None:
             for path in sorted(current_state.keys() - self._file_state.keys()):
@@ -474,7 +490,7 @@ class WorkspacePanel(Vertical):
         self._file_state = current_state
         if changes:
             self._pending_changes.extend(changes)
-        self.query_one("#workspace_tree", Static).update(_workspace_tree())
+        self.query_one("#workspace_tree", Static).update(_workspace_tree(root=self.root))
         if activity is not None:
             self.query_one("#workspace_activity", Static).update(activity)
         elif changes:
@@ -514,7 +530,8 @@ class ThreadPanel(Vertical):
                 else ""
             )
             text.append(f"{marker}{record.title}\n", style=style)
-            text.append(f"   {record.thread_id} · {record.trust_mode}\n", style=WALLACE_THEME["muted"])
+            timeout = f" · {record.approval_timeout_seconds}s" if record.trust_mode == "informed-trust" else ""
+            text.append(f"   {record.thread_id} · {record.trust_mode}{timeout}\n", style=WALLACE_THEME["muted"])
         self.query_one("#thread_list", Static).update(text)
 
 
@@ -839,14 +856,17 @@ class CloudKeyScreen(ModalScreen[str | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
 
-    def __init__(self, provider: str) -> None:
+    def __init__(self, provider: str, *, save: bool = False) -> None:
         super().__init__()
         self.provider = provider
+        self.save = save
 
     def compose(self) -> ComposeResult:
         with Vertical(id="cloud_key_dialog"):
             yield Static(f"Enter {self.provider} API key", id="cloud_key_title")
             yield Static(
+                "Hidden input. Saved in the OS keyring; Esc cancels."
+                if self.save else
                 "Hidden input. This entry applies to the running session; Esc cancels.",
                 id="cloud_key_hint",
             )
@@ -1006,30 +1026,39 @@ class AgentTUI(App):
         ("f9", "change_theme", "Themes"),
         ("f10", "show_models", "Models"),
         ("f11", "show_mcp", "MCP"),
+        ("f12", "show_keys", "API keys"),
         Binding("escape", "cancel", "Cancel request", show=False),
     ]
 
     def __init__(self) -> None:
+        ensure_workspace()
         self._theme_ready = False
         super().__init__()
         for theme in (*WALLACE_PRESETS, *discover_omarchy_themes()):
             self.register_theme(theme)
-        saved_theme = load_theme_choice(SAFE_ROOT)
+        saved_theme = load_theme_choice(APP_ROOT)
         self.theme = saved_theme if self.get_theme(saved_theme) else DEFAULT_THEME
         self._last_persisted_theme = self.theme
         WALLACE_THEME.update(rich_palette(self.current_theme))
-        self.model_name = load_model_choice(SAFE_ROOT, OLLAMA_MODEL)
+        self.model_name = load_model_choice(APP_ROOT, OLLAMA_MODEL)
         self.credentials = CloudCredentials()
         self.agent = None
         self.thread_config = None
         self.workspace_panel = None
         self._workspace_width = 30
-        self.thread_manager = ConversationThreadManager(SAFE_ROOT)
-        self.thread_manager.ensure("main")
+        self.thread_manager = ConversationThreadManager(
+            APP_ROOT, scope="development" if DEV_MODE else "workspace"
+        )
+        self.thread_manager.ensure("wallace_dev" if DEV_MODE else "main")
         self.thread_id = self.thread_manager.active_thread_id()
+        self.workspace_root = thread_workspace(
+            self.thread_id, project_root=APP_ROOT, development=DEV_MODE,
+        )
         self.conversation_store = self.thread_manager.store(self.thread_id)
+        self.session_usage = SessionUsage()
         self._conversation_history: list[dict[str, str]] = []
         self._active_plan = None
+        self._known_threads: tuple = ()
 
     def watch_theme(self, theme_name: str) -> None:
         theme = self.get_theme(theme_name)
@@ -1046,7 +1075,7 @@ class AgentTUI(App):
             self._set_thinking_status(rotate=self._rotate_thinking_status)
         if theme_name != self._last_persisted_theme:
             try:
-                save_theme_choice(SAFE_ROOT, theme_name)
+                save_theme_choice(APP_ROOT, theme_name)
                 self._last_persisted_theme = theme_name
             except OSError as error:
                 self._write_warning(f"Could not save theme choice: {error}")
@@ -1063,7 +1092,7 @@ class AgentTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        ArchiveManager(SAFE_ROOT).run_at_session_boundary()
+        ArchiveManager(APP_ROOT).run_at_session_boundary()
         self.chat_log = self.query_one("#chat_log", SelectableRichLog)
         self.prompt_input = self.query_one("#prompt", HistoryInput)
         self.thinking_panel = self.query_one("#thinking", Static)
@@ -1073,7 +1102,8 @@ class AgentTUI(App):
         self._update_header_datetime()
         self.set_interval(15.0, self._update_header_datetime)
         self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
-        self.workspace_panel.refresh_view()
+        self._known_threads = self._thread_snapshot()
+        self.workspace_panel.set_root(self.workspace_root)
         self.set_interval(2.0, self._refresh_workspace)
         self._conversation_history = self.conversation_store.load()
         self.prompt_input.load_history(
@@ -1106,7 +1136,8 @@ class AgentTUI(App):
         self._write_chat_block(Text("Welcome to Wallace.", style=f"bold {WALLACE_THEME['success']}"))
         self._write_chat_block(
             f"Thread: {self.thread_id} · trust: {self.thread_manager.resolve(self.thread_id).trust_mode}. "
-            "/threads /new /switch /trust /edit /rename /remove /clear /theme /model /mcp"
+            + ("Workspace: Wallace source. " if self.workspace_root == APP_ROOT else "Workspace: workspace/. ") +
+            "/status /threads /new /switch /trust /edit /rename /remove /clear /theme /model /mcp /keys"
         )
         self._announce_trust_risk(self.thread_manager.resolve(self.thread_id).trust_mode)
         self._restore_conversation()
@@ -1131,8 +1162,9 @@ class AgentTUI(App):
 
     def _announce_trust_risk(self, mode: str) -> None:
         if mode == "informed-trust":
+            seconds = self.thread_manager.resolve(self.thread_id).approval_timeout_seconds
             self._write_chat_block(Text(
-                "Informed-trust: approval-required actions auto-run after 10 seconds unless you interact with the preview.",
+                f"Informed-trust: approval-required actions auto-run after {seconds} seconds unless you interact with the preview.",
                 style=WALLACE_THEME["warning"],
             ))
         elif mode == "yes-trust":
@@ -1199,7 +1231,7 @@ class AgentTUI(App):
                 credentials=self.credentials,
             )
         except Exception as error:
-            self._write_warning(f"Failed to start agent: {error}")
+            self._write_warning(f"Failed to start agent: {self.credentials.redact(str(error))}")
             # A failed setup must not leave dev_tui.py waiting forever for an
             # agent that will never become idle.
             self._set_busy(False)
@@ -1226,7 +1258,7 @@ class AgentTUI(App):
     async def _ensure_cloud_key(self, provider: str) -> bool:
         if self.credentials.get(provider) is not None:
             return True
-        if use_environment_key(self.credentials, provider):
+        if use_active_key(self.credentials, provider, APP_ROOT):
             return True
         return await self._prompt_cloud_key(provider)
 
@@ -1282,7 +1314,7 @@ class AgentTUI(App):
     def action_show_mcp(self) -> None:
         """Show saved endpoint choices and observed live connection state."""
         try:
-            servers = all_mcp_servers(SAFE_ROOT)
+            servers = all_mcp_servers(APP_ROOT)
         except (OSError, ValueError) as error:
             self._write_warning(f"Could not list MCP servers: {error}")
             return
@@ -1309,9 +1341,9 @@ class AgentTUI(App):
         previous_status = snapshot_connection_statuses()
         changed = False
         try:
-            previous_config = read_mcp_configuration(SAFE_ROOT)
+            previous_config = read_mcp_configuration(APP_ROOT)
             changed = apply_mcp_command(
-                SAFE_ROOT, operation, name, url, keywords, live_applied=True
+                APP_ROOT, operation, name, url, keywords, live_applied=True
             )
             if not changed and operation != "reload":
                 self.chat_log.write(f"MCP server {name} is already {operation}.")
@@ -1334,7 +1366,7 @@ class AgentTUI(App):
         except Exception as error:
             if changed and previous_config is not None:
                 try:
-                    save_mcp_configuration(SAFE_ROOT, previous_config, live_applied=True)
+                    save_mcp_configuration(APP_ROOT, previous_config, live_applied=True)
                 except (OSError, ValueError) as rollback_error:
                     self._write_warning(f"MCP rollback failed: {rollback_error}")
             restore_connection_statuses(previous_status)
@@ -1363,7 +1395,7 @@ class AgentTUI(App):
                     variable = "OPENAI_API_KEY" if source == "openai" else "GOOGLE_API_KEY"
                     self._write_warning(f"{source.title()}: set {variable} in .env or the environment to list account models.")
                 except Exception as error:
-                    self._write_warning(f"Could not list {source} models: {error}")
+                    self._write_warning(f"Could not list {source} models: {self.credentials.redact(str(error))}")
         finally:
             self.chat_log.write(
                 "Use /models [ollama|openai|gemini] to filter; /model <name> to switch. "
@@ -1398,7 +1430,7 @@ class AgentTUI(App):
                 model_name=requested,
                 credentials=self.credentials,
             )
-            save_model_choice(SAFE_ROOT, requested)
+            save_model_choice(APP_ROOT, requested)
             self.agent, self.thread_config = replacement_agent, replacement_config
             self.model_name = requested
             if provider == "ollama":
@@ -1448,6 +1480,88 @@ class AgentTUI(App):
         finally:
             self._set_busy(False)
 
+    def action_show_keys(self) -> None:
+        try:
+            self._write_chat_block(Text("API keys (values never shown):", style=WALLACE_THEME["primary"]))
+            for entry in list_keys(APP_ROOT):
+                status = "active" if entry.enabled and entry.available else (
+                    "unavailable" if not entry.available else "inactive"
+                )
+                self.chat_log.write(f"  {entry.name} [{entry.provider}, {entry.source}] — {status}")
+            self.chat_log.write(
+                "Use /key add <name> <openai|gemini>, /key on|off|remove <name>. "
+                "Environment keys must be deleted from .env by you."
+            )
+        except (OSError, ValueError) as error:
+            self._write_warning(f"Could not list API keys: {error}")
+
+    def _status_context(self) -> StatusContext:
+        record = self.thread_manager.resolve(self.thread_id)
+        return StatusContext(
+            usage=self.session_usage,
+            thread_id=self.thread_id,
+            model_name=self.model_name,
+            trust_mode=record.trust_mode,
+            approval_timeout_seconds=record.approval_timeout_seconds,
+            workspace=self.workspace_root,
+        )
+
+    def action_show_status(self) -> None:
+        self._write_chat_block(Text(self._status_context().render(), style=WALLACE_THEME["primary"]))
+
+    @work(exclusive=True, group="keys")
+    async def add_cloud_key(self, name: str, provider: str) -> None:
+        self._set_busy(True)
+        try:
+            if provider not in {"openai", "gemini"}:
+                raise ValueError("provider must be openai or gemini")
+            secret = await self.push_screen_wait(CloudKeyScreen(provider, save=True))
+            if secret is None:
+                return
+            add_key(APP_ROOT, name, provider, secret)
+            await self._refresh_key_for_model(provider)
+            self._write_chat_block(Text(f"Saved and activated API key: {name} ({provider}).", style=WALLACE_THEME["success"]))
+        except (OSError, RuntimeError, ValueError) as error:
+            self._write_warning(f"Could not add API key: {self.credentials.redact(str(error))}")
+        finally:
+            self._set_busy(False)
+
+    async def _refresh_key_for_model(self, provider: str) -> None:
+        self.credentials.clear(provider)
+        selected_provider, _ = parse_model_selection(self.model_name)
+        if selected_provider != provider:
+            return
+        if not use_active_key(self.credentials, provider, APP_ROOT):
+            self.agent = None
+            self.thread_config = None
+            self._write_warning("Current cloud model has no active key; enable one or switch models.")
+            return
+        self.agent = None
+        self.thread_config = None
+        self.agent, self.thread_config = await setup_agent(
+            on_status=self._write_warning,
+            model_name=self.model_name,
+            credentials=self.credentials,
+        )
+
+    @work(exclusive=True, group="keys")
+    async def manage_cloud_key(self, operation: str, name: str) -> None:
+        self._set_busy(True)
+        try:
+            entry = next((item for item in list_keys(APP_ROOT) if item.name.casefold() == name.casefold()), None)
+            if entry is None:
+                raise ValueError("unknown API key name")
+            if operation == "remove":
+                remove_key(APP_ROOT, name)
+            else:
+                set_key_active(APP_ROOT, name, operation == "on")
+            await self._refresh_key_for_model(entry.provider)
+            self._write_chat_block(Text(f"API key {operation} completed: {entry.name}.", style=WALLACE_THEME["success"]))
+        except (OSError, RuntimeError, ValueError) as error:
+            self._write_warning(f"Could not change API key: {self.credentials.redact(str(error))}")
+        finally:
+            self._set_busy(False)
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         prompt = event.value.strip()
         self.prompt_input.value = ""
@@ -1483,7 +1597,7 @@ class AgentTUI(App):
         self._active_plan = None
         try:
             self._active_plan = resume_or_create(
-                SAFE_ROOT, prompt, session_id=self.thread_id
+                APP_ROOT, prompt, session_id=plan_session_id(self.thread_id, development=DEV_MODE)
             )
             agent_prompt = planning_context(
                 self._active_plan,
@@ -1519,7 +1633,7 @@ class AgentTUI(App):
             try:
                 if self._active_plan is not None:
                     self._active_plan.record_progress([], response=host_response)
-                    save_plan(SAFE_ROOT, self._active_plan)
+                    save_plan(APP_ROOT, self._active_plan)
                 self.conversation_store.append("assistant", host_response)
                 self._conversation_history = self.conversation_store.load()
                 self.conversation_store.clear_pending()
@@ -1554,6 +1668,8 @@ class AgentTUI(App):
         self._shown_tool_calls: set[tuple] = set()
         self._shown_tool_results: set[tuple] = set()
         initial_prompt = prompt
+        workspace_token = set_active_workspace(self.workspace_root)
+        status_token = bind_status(self._status_context())
         try:
             if user_prompt is not None:
                 memory = ""
@@ -1564,6 +1680,7 @@ class AgentTUI(App):
                             summarize_thread_memory,
                             model_name=self.model_name,
                             credentials=self.credentials,
+                            usage_tracker=self.session_usage,
                         ),
                         max_chars=memory_budget_for(prompt),
                     )
@@ -1590,6 +1707,7 @@ class AgentTUI(App):
                                 messages = [messages]
                             for msg in messages:
                                 turn_messages.append(msg)
+                                self.session_usage.record_message(msg, self.model_name)
                                 self._show_progress(msg)
                 except Exception as error:
                     if not recovery_attempted and is_malformed_tool_call_error(error):
@@ -1616,6 +1734,7 @@ class AgentTUI(App):
                         stored_response = assistant_response_text(stored_messages)
                         if stored_response is not None:
                             response = stored_response
+                        self.session_usage.record_messages(stored_messages, self.model_name)
                         turn_messages.extend(stored_messages)
                     except Exception:
                         pass
@@ -1713,7 +1832,7 @@ class AgentTUI(App):
                         [],
                         error=status,
                     )
-                    save_plan(SAFE_ROOT, self._active_plan)
+                    save_plan(APP_ROOT, self._active_plan)
                 self._write_chat_block(
                     Text(
                         status,
@@ -1739,7 +1858,7 @@ class AgentTUI(App):
                     response = verified_plan_response(
                         self._active_plan, response, activity
                     )
-                    save_plan(SAFE_ROOT, self._active_plan)
+                    save_plan(APP_ROOT, self._active_plan)
                     self.thread_manager.touch(self.thread_id)
                     self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
                 self._write_chat_block(
@@ -1758,7 +1877,9 @@ class AgentTUI(App):
             if self._active_plan is not None:
                 try:
                     state = await self.agent.aget_state(self.thread_config)
-                    turn_messages.extend(state.values.get("messages", []))
+                    stored_messages = state.values.get("messages", [])
+                    self.session_usage.record_messages(stored_messages, self.model_name)
+                    turn_messages.extend(stored_messages)
                 except Exception:
                     pass
                 try:
@@ -1770,17 +1891,20 @@ class AgentTUI(App):
                     self._active_plan.record_progress(
                         model_tool_activity(turn_messages), error=recorded_error
                     )
-                    save_plan(SAFE_ROOT, self._active_plan)
+                    save_plan(APP_ROOT, self._active_plan)
                 except Exception:
                     pass
             self._write_warning(describe_error(error, self.model_name))
         finally:
+            reset_status(status_token)
+            reset_active_workspace(workspace_token)
             # Keep only the current turn's tool transcript in the graph.
             self.thread_config = new_thread_config()
             self._set_busy(False)
 
     async def _ask_approval(self, request: dict) -> bool:
-        mode = self.thread_manager.resolve(self.thread_id).trust_mode
+        record = self.thread_manager.resolve(self.thread_id)
+        mode = record.trust_mode
         if mode == "yes-trust":
             self.chat_log.write(Text(
                 "  Auto-approved by yes-trust mode.", style=WALLACE_THEME["warning"]
@@ -1793,7 +1917,7 @@ class AgentTUI(App):
         self.push_screen(
             ApprovalScreen(
                 detail,
-                countdown_seconds=10 if mode == "informed-trust" else None,
+                countdown_seconds=record.approval_timeout_seconds if mode == "informed-trust" else None,
             ),
             lambda result: future.done() or future.set_result(bool(result)),
         )
@@ -1871,7 +1995,12 @@ class AgentTUI(App):
         record = self.thread_manager.resolve(thread_id)
         self.thread_manager.select_thread(record.thread_id)
         self.thread_id = record.thread_id
+        self.workspace_root = thread_workspace(
+            self.thread_id, project_root=APP_ROOT, development=DEV_MODE,
+        )
         self.conversation_store = self.thread_manager.store(self.thread_id)
+        if self.workspace_panel is not None:
+            self.workspace_panel.set_root(self.workspace_root)
         self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
         self._conversation_history = self.conversation_store.load()
         self.prompt_input.load_history(
@@ -1885,7 +2014,8 @@ class AgentTUI(App):
         self.thread_config = new_thread_config()
         self.chat_log.clear()
         self._write_chat_block(Text(
-            f"Thread: {record.thread_id} — {record.title} · trust: {record.trust_mode}",
+            f"Thread: {record.thread_id} — {record.title} · trust: {record.trust_mode} · "
+            f"workspace: {self.workspace_root}",
             style=WALLACE_THEME["success"],
         ))
         self._announce_trust_risk(record.trust_mode)
@@ -1905,12 +2035,20 @@ class AgentTUI(App):
         try:
             if self._busy and action in {"/new", "/switch", "/rename", "/remove", "/delete", "/trust", "/edit"}:
                 raise ValueError("finish or cancel the current request before changing threads or editing files")
-            if action == "/key":
-                if len(parts) != 1:
-                    self._write_warning("Use /key with no argument; enter the secret in the masked dialog.")
-                elif not self._busy:
-                    self._set_busy(True)
-                    self.change_cloud_key()
+            if action in {"/key", "/keys"}:
+                if len(parts) == 2 and parts[1].lower() == "session":
+                    if not self._busy:
+                        self.change_cloud_key()
+                else:
+                    operation, name, provider = parse_key_command(parts[1:])
+                    if operation == "list":
+                        self.action_show_keys()
+                    elif self._busy:
+                        self._write_warning("Finish the current request before changing API keys.")
+                    elif operation == "add":
+                        self.add_cloud_key(name, provider)
+                    else:
+                        self.manage_cloud_key(operation, name)
             elif action in {"/model", "/models"}:
                 if action == "/models":
                     if len(parts) > 2 or (len(parts) == 2 and parts[1].lower() not in {"ollama", "openai", "gemini"}):
@@ -1925,7 +2063,7 @@ class AgentTUI(App):
                         self._set_busy(True)
                         self.change_model(" ".join(parts[1:]))
             elif action in {"/mcp", "/mcps"}:
-                operation, name, url, keywords = parse_mcp_command(parts[1:], SAFE_ROOT)
+                operation, name, url, keywords = parse_mcp_command(parts[1:], APP_ROOT)
                 if operation == "list":
                     self.action_show_mcp()
                 else:
@@ -1954,25 +2092,30 @@ class AgentTUI(App):
                         raise ValueError(f"unknown theme: {' '.join(parts[1:])}")
                     self.theme = selected
                     self.chat_log.write(f"Theme: {selected}")
+            elif action == "/status" and len(parts) == 1:
+                self.action_show_status()
             elif action in {"/threads", "/thread"}:
                 self.chat_log.write(Text("Conversation threads:", style=WALLACE_THEME["primary"]))
                 for record in self.thread_manager.list_threads():
                     marker = "*" if record.thread_id == self.thread_id else " "
-                    self.chat_log.write(f"{marker} {record.thread_id}: {record.title} [{record.trust_mode}]")
+                    timeout = f", {record.approval_timeout_seconds}s" if record.trust_mode == "informed-trust" else ""
+                    self.chat_log.write(f"{marker} {record.thread_id}: {record.title} [{record.trust_mode}{timeout}]")
             elif action == "/new":
                 title, trust_mode = parse_new_thread_arguments(parts[1:])
                 record = self.thread_manager.create(title, trust_mode=trust_mode)
                 self._switch_thread(record.thread_id)
             elif action == "/trust":
                 if len(parts) == 1:
-                    current = self.thread_manager.resolve(self.thread_id).trust_mode
+                    record = self.thread_manager.resolve(self.thread_id)
+                    timeout = f" ({record.approval_timeout_seconds}s)" if record.trust_mode == "informed-trust" else ""
                     self._write_chat_block(
-                        f"Trust: {current}. Modes: {', '.join(TRUST_MODES)}. "
-                        "Use /trust <mode> to change this thread."
+                        f"Trust: {record.trust_mode}{timeout}. Modes: {', '.join(TRUST_MODES)}. "
+                        "Use /trust informed-trust [SECONDS] to set the countdown."
                     )
-                elif len(parts) == 2:
+                elif len(parts) in {2, 3}:
                     record = self.thread_manager.set_trust_mode(
-                        self.thread_id, validate_trust_mode(parts[1])
+                        self.thread_id, validate_trust_mode(parts[1]),
+                        parts[2] if len(parts) == 3 else None,
                     )
                     self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
                     self._write_chat_block(Text(
@@ -1980,14 +2123,14 @@ class AgentTUI(App):
                         + (
                             "Approval-required tools now run without a prompt; they can modify files and access your OS account."
                             if record.trust_mode == "yes-trust" else
-                            "Approval-required tools auto-run after 10 seconds unless you interact with the dialog."
+                            f"Approval-required tools auto-run after {record.approval_timeout_seconds} seconds unless you interact with the dialog."
                             if record.trust_mode == "informed-trust" else
                             "Approval-required tools need Y/N confirmation."
                         ),
                         style=WALLACE_THEME["warning"],
                     ))
                 else:
-                    raise ValueError("use /trust [no-trust|informed-trust|yes-trust]")
+                    raise ValueError("use /trust [no-trust|informed-trust [SECONDS]|yes-trust]")
             elif action == "/edit":
                 if len(parts) == 1:
                     self.action_edit_file()
@@ -2013,7 +2156,7 @@ class AgentTUI(App):
             elif action == "/clear":
                 self.action_clear_log()
             else:
-                self._write_warning("Commands: /threads, /new [--trust MODE] [title], /trust [MODE], /edit [path], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /key")
+                self._write_warning("Commands: /status, /threads, /new [--trust MODE] [title], /trust [MODE [SECONDS]], /edit [path], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /keys")
         except (OSError, ValueError) as error:
             self._write_warning(f"Thread command failed: {error}")
 
@@ -2030,7 +2173,7 @@ class AgentTUI(App):
         if self._busy:
             self._write_warning("Finish or cancel the current request before editing a file.")
             return
-        paths = sorted(_workspace_file_state(), key=str.casefold)
+        paths = sorted(_workspace_file_state(self.workspace_root), key=str.casefold)
         if not paths:
             self._write_warning("No editable workspace files were found.")
             return
@@ -2043,8 +2186,8 @@ class AgentTUI(App):
         if self._busy:
             self._write_warning("Finish or cancel the current request before editing a file.")
             return
-        path = (SAFE_ROOT / relative_path).resolve()
-        if not path.is_file() or not _allowed_workspace_path(path):
+        path = (self.workspace_root / relative_path).resolve()
+        if not path.is_file() or not _allowed_workspace_path(path, self.workspace_root):
             self._write_warning("Choose an existing, non-sensitive file inside the workspace.")
             return
         editor = shutil.which("nvim") or shutil.which("vim") or shutil.which("vi")
@@ -2054,10 +2197,10 @@ class AgentTUI(App):
         self._set_busy(True)
         try:
             with self.suspend():
-                result = subprocess.run([editor, "--", str(path)], cwd=SAFE_ROOT, check=False)
-            self.workspace_panel.refresh_view(f"Edited {path.relative_to(SAFE_ROOT)}")
+                result = subprocess.run([editor, "--", str(path)], cwd=self.workspace_root, check=False)
+            self.workspace_panel.refresh_view(f"Edited {path.relative_to(self.workspace_root)}")
             if result.returncode == 0:
-                self._write_chat_block(f"Editor closed: {path.relative_to(SAFE_ROOT)}")
+                self._write_chat_block(f"Editor closed: {path.relative_to(self.workspace_root)}")
             else:
                 self._write_warning(f"Editor exited with status {result.returncode}.")
         except (OSError, RuntimeError, SuspendNotSupported) as error:
@@ -2068,6 +2211,50 @@ class AgentTUI(App):
     def _refresh_workspace(self) -> None:
         if self.workspace_panel is not None and self.workspace_panel.query("#workspace_tree"):
             self.workspace_panel.refresh_view()
+        self._refresh_shared_threads()
+
+    def _thread_snapshot(self) -> tuple:
+        return tuple(
+            (record.thread_id, record.title, record.updated_at, record.trust_mode,
+             record.approval_timeout_seconds)
+            for record in self.thread_manager.list_threads()
+        )
+
+    def _refresh_shared_threads(self) -> None:
+        """Notice thread and transcript changes made by another Wallace window."""
+        if (not getattr(self, "thread_panel", None)
+                or not self.thread_panel.is_mounted
+                or not list(self.thread_panel.query("#thread_list"))):
+            return
+        try:
+            snapshot = self._thread_snapshot()
+            if snapshot != self._known_threads:
+                self.thread_panel.refresh_threads(self.thread_manager, self.thread_id)
+                self._known_threads = snapshot
+            if self._busy:
+                return
+            ids = {item[0] for item in snapshot}
+            if self.thread_id not in ids:
+                preferred = "wallace_dev" if DEV_MODE else "main"
+                replacement = preferred if preferred in ids else (snapshot[0][0] if snapshot else None)
+                if replacement is not None:
+                    self._switch_thread(replacement)
+                return
+            history = self.conversation_store.load()
+            if history == self._conversation_history:
+                return
+            self._conversation_history = history
+            self.prompt_input.load_history([
+                item["content"] for item in history if item["role"] == "user"
+            ])
+            self.chat_log.clear()
+            self._write_chat_block(Text(
+                f"Thread {self.thread_id} updated in another Wallace instance.",
+                style=WALLACE_THEME["primary"],
+            ))
+            self._restore_conversation()
+        except (OSError, ValueError) as error:
+            self._write_warning(f"Could not refresh shared threads: {error}")
 
     def action_toggle_workspace(self) -> None:
         if self.workspace_panel is None:

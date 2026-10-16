@@ -1,4 +1,4 @@
-"""Model selection and session-only cloud credentials shared by CLI and TUI."""
+"""Model selection and host-held cloud credentials shared by CLI and TUI."""
 
 from __future__ import annotations
 
@@ -21,34 +21,47 @@ CLOUD_KEY_VARIABLES = {"openai": "OPENAI_API_KEY", "gemini": "GOOGLE_API_KEY"}
 class MissingCredentialError(ValueError):
     def __init__(self, provider: str) -> None:
         self.provider = provider
-        super().__init__(f"{provider} needs an API key entered in Wallace for this session")
+        super().__init__(f"{provider} needs an active API key")
 
 
 class CloudCredentials:
-    """Hold one provider key in memory, never in conversation or project files."""
+    """Hold provider keys in host memory, never in model-facing messages."""
 
     def __init__(self) -> None:
-        self._provider: str | None = None
-        self._secret: SecretStr | None = None
+        self._secrets: dict[str, SecretStr] = {}
 
     def set(self, provider: str, key: str) -> None:
         if provider not in CLOUD_PROVIDERS or not key or any(char.isspace() for char in key):
             raise ValueError("Enter a nonempty API key without whitespace")
-        self._provider = provider
-        self._secret = SecretStr(key)
+        self._secrets[provider] = SecretStr(key)
 
     def get(self, provider: str) -> SecretStr | None:
-        return self._secret if provider == self._provider else None
+        return self._secrets.get(provider)
 
-    def clear(self) -> None:
-        self._provider = None
-        self._secret = None
+    def clear(self, provider: str | None = None) -> None:
+        if provider is None:
+            self._secrets.clear()
+        else:
+            self._secrets.pop(provider, None)
 
     def redact(self, message: str) -> str:
-        if self._secret is None:
-            return message
-        value = self._secret.get_secret_value()
-        return message.replace(value, "[REDACTED API KEY]") if value else message
+        for secret in self._secrets.values():
+            value = secret.get_secret_value()
+            if value:
+                message = message.replace(value, "[REDACTED API KEY]")
+        return message
+
+
+def use_active_key(credentials: CloudCredentials, provider: str, root: Path) -> bool:
+    """Load a user-enabled environment or keyring key into host memory."""
+    from wallace_keys import active_key
+
+    secret = active_key(root, provider)
+    if secret is None:
+        credentials.clear(provider)
+        return False
+    credentials.set(provider, secret.get_secret_value())
+    return True
 
 
 def environment_key(provider: str) -> SecretStr | None:

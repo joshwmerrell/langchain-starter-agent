@@ -12,26 +12,48 @@ import sys
 import tempfile
 import tomllib
 
+from contextvars import ContextVar, Token
 from fnmatch import fnmatch
 from pathlib import Path
 
 from langchain.tools import tool
+from langchain_core.tools import StructuredTool
 
 from dependency_analysis import DependencyGraph, analyze_change_impact
 from wallace_mcp import all_mcp_servers, connection_status
+from wallace_runtime import APP_ROOT, DEV_MODE, WORKSPACE_ROOT
+from wallace_status import current_status_text
 
-# Files outside this directory can never be accessed by the agent.
-SAFE_ROOT = Path(__file__).resolve().parent
+# Model-facing file tools default to the ordinary work area. Only the host may
+# select the source root for the permanent development thread.
+SAFE_ROOT = WORKSPACE_ROOT
+_ACTIVE_ROOT: ContextVar[Path | None] = ContextVar("wallace_active_workspace", default=None)
+
+
+def current_workspace_root() -> Path:
+    return _ACTIVE_ROOT.get() or SAFE_ROOT
+
+
+def set_active_workspace(root: Path) -> Token:
+    resolved = root.resolve()
+    if resolved == APP_ROOT.resolve() and not DEV_MODE:
+        raise ValueError("source workspace is unavailable outside development mode")
+    return _ACTIVE_ROOT.set(resolved)
+
+
+def reset_active_workspace(token: Token) -> None:
+    _ACTIVE_ROOT.reset(token)
 
 # Names the agent may not read, list, search, or write, matched against every
 # path component (case-insensitive).
 SENSITIVE_PATTERNS = [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*"]
 
-# Never readable or writable (git internals and Wallace's private state).
-HIDDEN_DIRS = {".git", ".wallace"}
+# Never readable or writable through model-facing file tools.
+PRIVATE_DIRS = {".wallace", ".aws", ".ssh", ".gnupg", ".config", ".codex", ".agents"}
+HIDDEN_DIRS = PRIVATE_DIRS | {".git"}
 
 # Hidden from trees and searches, and never writable.
-SKIP_DIRS = {".git", ".wallace", "node_modules", "__pycache__", ".venv", "venv"}
+SKIP_DIRS = HIDDEN_DIRS | {"node_modules", "__pycache__", ".venv", "venv"}
 
 # Output limits keep tool results small, which matters with a local model's
 # limited context window.
@@ -49,23 +71,35 @@ TEST_TIMEOUT = 180
 
 ACCESS_DENIED = (
     "Error: Access denied or file not found. Use a project-root-relative path "
-    "as shown by get_project_tree (for example, main.py)."
+    "as shown by get_project_tree (for example, notes.txt)."
+)
+
+GIT_UNAVAILABLE = (
+    "Git metadata is not available in the selected workspace. This is normal "
+    "for an ordinary Wallace workspace; continue with file and directory tools."
 )
 
 
 def _tool_environment() -> dict[str, str]:
     """Do not pass common credential variables to model-invoked subprocesses.
 
-    This reduces accidental disclosure but is not a sandbox: commands still
-    run as the user's OS account and may read accessible files.
+    The command sandbox also hides local private paths, but the subprocess
+    still runs under the user's OS identity; it is not a perfect isolation
+    boundary against local services.
     """
     blocked = ("_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
-    return {
+    environment = {
         name: value for name, value in os.environ.items()
         if not name.upper().endswith(blocked)
         and not name.upper().startswith("AWS_")
-        and name.upper() not in {"SSH_AUTH_SOCK", "GPG_AGENT_INFO"}
+        and name.upper() not in {
+            "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_RUNTIME_DIR", "PYTHONPATH", "WALLACE_DEV_MODE",
+        }
     }
+    environment["HOME"] = "/tmp"
+    environment["PATH"] = str(APP_ROOT / ".venv" / "bin") + os.pathsep + "/usr/bin:/bin"
+    return environment
 
 
 # ---------------------------------------------------------------------------
@@ -74,9 +108,10 @@ def _tool_environment() -> dict[str, str]:
 
 def _is_allowed(resolved: Path) -> bool:
     """Whether a resolved path is inside SAFE_ROOT and not sensitive."""
-    if not resolved.is_relative_to(SAFE_ROOT):
+    root = current_workspace_root()
+    if not resolved.is_relative_to(root):
         return False
-    parts = resolved.relative_to(SAFE_ROOT).parts
+    parts = resolved.relative_to(root).parts
     if any(part.lower() in SKIP_DIRS for part in parts):
         return False
     return not any(
@@ -94,7 +129,7 @@ def _resolve(path: str) -> Path | None:
     leak which paths exist.
     """
     try:
-        target = (SAFE_ROOT / path).resolve()
+        target = (current_workspace_root() / path).resolve()
     except (OSError, ValueError):
         return None
     return target if _is_allowed(target) else None
@@ -145,10 +180,92 @@ def _truncate_middle(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return f"{text[:head]}\n...[{len(text) - limit} characters omitted]...\n{text[-tail:]}"
 
 
+def _sandbox_command(
+    args: list[str] | str,
+    *,
+    shell: bool,
+    cwd: Path,
+    expose_git_config: bool = False,
+    sandbox_root: Path | None = None,
+) -> list[str]:
+    """Mount only the active work area for model-invoked processes.
+
+    A missing Bubblewrap fails closed instead of running on the host.
+    """
+    bubblewrap = shutil.which("bwrap")
+    if bubblewrap is None:
+        raise RuntimeError("Bubblewrap (bwrap) is required for command and test tools")
+    root = (sandbox_root or current_workspace_root()).resolve()
+    working = cwd.resolve()
+    if not working.is_relative_to(root):
+        raise RuntimeError("command working directory is outside the active workspace")
+    command = [bubblewrap, "--die-with-parent", "--unshare-pid"]
+    for directory in ("/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"):
+        if Path(directory).exists():
+            command.extend(["--ro-bind", directory, directory])
+    command.extend(["--dev-bind", "/dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+    command.extend(["--bind", str(root), str(root)])
+    virtualenv = APP_ROOT / ".venv"
+    if root != APP_ROOT.resolve() and virtualenv.is_dir():
+        command.extend(["--ro-bind", str(virtualenv), str(virtualenv)])
+    interpreter = Path(sys.executable).resolve()
+    if not interpreter.is_relative_to(Path("/usr")) and not interpreter.is_relative_to(Path("/bin")):
+        distribution = interpreter.parent.parent
+        if distribution.is_dir() and not distribution.is_relative_to(root):
+            command.extend(["--ro-bind", str(distribution), str(distribution)])
+            launcher = Path(sys.executable)
+            if launcher.is_symlink():
+                link = launcher.readlink()
+                link = link if link.is_absolute() else launcher.parent / link
+                alias_distribution = link.parent.parent
+                if alias_distribution != distribution and not alias_distribution.is_relative_to(root):
+                    # uv's venv Python can point through an unversioned alias
+                    # before reaching the versioned installation.
+                    command.extend(["--ro-bind", str(distribution), str(alias_distribution)])
+    # File-tool denials must hold for shell/test tools too, including nested
+    # .env and key files in a user workspace. Do not traverse virtualenvs,
+    # package trees or git internals for every command.
+    for current, directories, files in os.walk(root, followlinks=False):
+        kept = []
+        for name in directories:
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            if name.lower() in PRIVATE_DIRS or any(
+                fnmatch(name.lower(), pattern) for pattern in SENSITIVE_PATTERNS
+            ):
+                command.extend(["--tmpfs", str(path)])
+            elif name.lower() == ".git":
+                config = path / "config"
+                if config.is_file() and not config.is_symlink():
+                    # Ordinary command/test tools must not inspect Git's
+                    # private metadata. The dedicated read-only Git tools
+                    # need the repository-local config, however: masking it
+                    # makes Git fail before it can report status or a diff.
+                    source = config if expose_git_config else Path("/dev/null")
+                    command.extend(["--ro-bind", str(source), str(config)])
+            elif name.lower() not in {".venv", "venv", "node_modules", "__pycache__"}:
+                kept.append(name)
+        directories[:] = kept
+        for name in files:
+            path = Path(current) / name
+            if path.is_symlink():
+                continue
+            if any(fnmatch(name.lower(), pattern) for pattern in SENSITIVE_PATTERNS):
+                command.extend(["--ro-bind", "/dev/null", str(path)])
+    command.extend(["--chdir", str(working), "--"])
+    if shell:
+        command.extend(["/bin/sh", "-c", str(args)])
+    else:
+        command.extend(str(arg) for arg in args)
+    return command
+
+
 def _run_command(
     args: list[str] | str, *, shell: bool = False,
     timeout: int = COMMAND_TIMEOUT, cwd: Path | None = None,
-    input_text: str | None = None,
+    input_text: str | None = None, expose_git_config: bool = False,
+    sandbox_root: Path | None = None,
 ) -> str:
     """Run a command in the project root and return formatted, bounded output.
 
@@ -156,10 +273,15 @@ def _run_command(
     so commands cannot wait for (or steal) input from the Textual UI.
     """
     try:
+        working = cwd or current_workspace_root()
+        sandboxed = _sandbox_command(
+            args, shell=shell, cwd=working, expose_git_config=expose_git_config,
+            sandbox_root=sandbox_root,
+        )
         r = subprocess.run(
-            args,
-            shell=shell,
-            cwd=cwd or SAFE_ROOT,
+            sandboxed,
+            shell=False,
+            cwd=working,
             env=_tool_environment(),
             capture_output=True,
             encoding="utf-8",
@@ -182,6 +304,31 @@ def _run_command(
     if r.stderr.strip():
         parts.append(f"STDERR:\n{r.stderr.strip()}")
     return _truncate_middle("\n".join(parts))
+
+
+def _git_available(root: Path | None = None) -> bool:
+    """Return whether the selected workspace contains Git metadata."""
+    marker = (root or current_workspace_root()) / ".git"
+    return marker.is_dir() or marker.is_file()
+
+
+def _git_root() -> Path | None:
+    """Return the repository root used by read-only Git tools.
+
+    Git inspection is intentionally repository-wide and read-only. This lets
+    an ordinary thread inspect changes in the source tree and in workspace/
+    without granting its file/edit tools access to source files.
+    """
+    for candidate in (APP_ROOT.resolve(), current_workspace_root().resolve()):
+        if _git_available(candidate):
+            return candidate
+    return None
+
+
+def _git_pathspec_excludes() -> list[str]:
+    excludes = [f":(glob,exclude)**/{pattern}" for pattern in SENSITIVE_PATTERNS]
+    excludes.extend(f":(glob,exclude)**/{directory}/**" for directory in PRIVATE_DIRS)
+    return excludes
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +388,9 @@ _SECTIONS = {
     "disk": lambda: _run(["df", "-h", "-x", "tmpfs", "-x", "devtmpfs"]),
     "temps": lambda: _run(["sensors"]),
     "network": lambda: _run(["ip", "-brief", "addr"]),
+    # Command-line arguments may contain secrets; report only process names.
     "processes": lambda: "\n".join(
-        _run(["ps", "aux", "--sort=-%mem"], 10000).splitlines()[:11]
+        _run(["ps", "-eo", "pid,comm", "--sort=-rss"], 10000).splitlines()[:11]
     ),
     "python": lambda: f"Python {platform.python_version()} at {sys.executable}",
 }
@@ -276,7 +424,12 @@ def get_system_info(section: str = "summary") -> str:
 
 @tool
 def get_project_tree(path: str = ".", max_depth: int = 2) -> str:
-    """Show the project's directory tree. Directories deeper than max_depth are listed without contents.
+    """Show the selected workspace's directory tree.
+
+    The selected workspace is the authoritative scope for the current thread;
+    it may be the ordinary ``workspace/`` directory rather than Wallace's
+    source repository. Directories deeper than max_depth are listed without
+    contents.
 
     Args:
         path: Directory relative to the project root. Defaults to the root.
@@ -293,7 +446,7 @@ def get_project_tree(path: str = ".", max_depth: int = 2) -> str:
         try:
             entries = sorted(
                 (e for e in current.iterdir()
-                 if e.name not in SKIP_DIRS and _is_allowed(e.resolve())),
+                 if e.name.lower() not in SKIP_DIRS and _is_allowed(e.resolve())),
                 key=lambda e: (e.is_file(), e.name.lower()),
             )
         except OSError:
@@ -316,7 +469,7 @@ def get_project_tree(path: str = ".", max_depth: int = 2) -> str:
         return lines
 
     lines = build(target, "", 1)
-    heading = f"{target.relative_to(SAFE_ROOT).as_posix()}/"
+    heading = f"{target.relative_to(current_workspace_root()).as_posix()}/"
     return heading + ("\n" + "\n".join(lines) if lines else " (empty)")
 
 
@@ -393,7 +546,7 @@ def search_in_files(
             yield target
             return
         for root, dirs, files in os.walk(target):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+            dirs[:] = sorted(d for d in dirs if d.lower() not in SKIP_DIRS)
             for name in sorted(files):
                 if fnmatch(name, file_glob):
                     yield Path(root) / name
@@ -409,7 +562,7 @@ def search_in_files(
             text = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue  # unreadable or binary
-        rel = resolved.relative_to(SAFE_ROOT).as_posix()
+        rel = resolved.relative_to(current_workspace_root()).as_posix()
         for number, line in enumerate(text.splitlines(), 1):
             if regex.search(line):
                 matches.append(f"{rel}:{number}: {line.strip()[:200]}")
@@ -527,13 +680,13 @@ def check_source_file(path: str) -> str:
         node_project = any(
             (parent / name).is_file()
             for parent in (target.parent, *target.parents)
-            if parent == SAFE_ROOT or parent.is_relative_to(SAFE_ROOT)
+            if parent == current_workspace_root() or parent.is_relative_to(current_workspace_root())
             for name in ("tsconfig.json", "package.json")
         )
         deno_project = any(
             (parent / name).is_file()
             for parent in (target.parent, *target.parents)
-            if parent == SAFE_ROOT or parent.is_relative_to(SAFE_ROOT)
+            if parent == current_workspace_root() or parent.is_relative_to(current_workspace_root())
             for name in ("deno.json", "deno.jsonc")
         )
         if deno_project or (not node_project and shutil.which("deno") is not None):
@@ -577,14 +730,14 @@ def summarize_project_file(path: str) -> str:
     target = _resolve(path)
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
-    graph = DependencyGraph(SAFE_ROOT).build()
+    graph = DependencyGraph(current_workspace_root()).build()
     return json.dumps(graph.summarize_module(target), indent=2)
 
 
 @tool
 def analyze_project_dependencies() -> str:
     """Build a project-wide Python import graph and report module relationships."""
-    graph = DependencyGraph(SAFE_ROOT).build()
+    graph = DependencyGraph(current_workspace_root()).build()
     lines = [f"Analyzed {len(graph.module_paths)} local Python modules."]
     for module in sorted(graph.module_paths):
         imports = ", ".join(sorted(graph.modules[module])) or "none"
@@ -609,18 +762,23 @@ def analyze_git_change_impact(staged: bool = False) -> str:
     to the Python import graph. Untracked Python files are included for the
     unstaged view.
     """
+    root = _git_root()
+    if root is None:
+        return GIT_UNAVAILABLE
     command = ["git", "diff", "--name-status"]
     if staged:
         command.append("--cached")
-    result = subprocess.run(
-        command,
-        cwd=SAFE_ROOT,
-        env=_tool_environment(),
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-    )
+    try:
+        result = subprocess.run(
+            _sandbox_command(
+                command, shell=False, cwd=root, expose_git_config=True, sandbox_root=root,
+            ),
+            cwd=root, env=_tool_environment(), capture_output=True,
+            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        return f"Error: Git change-impact analysis could not run: {error}"
     if result.returncode != 0:
         return f"Error: git diff failed ({result.stderr.strip()})."
 
@@ -630,7 +788,7 @@ def analyze_git_change_impact(staged: bool = False) -> str:
         if len(fields) < 2:
             continue
         status, path = fields[0], fields[-1]
-        if not path.endswith(".py"):
+        if not path.endswith(".py") or not _is_allowed((root / path).resolve()):
             continue
         hunk = (
             {"added": True}
@@ -642,18 +800,21 @@ def analyze_git_change_impact(staged: bool = False) -> str:
         changes.append({"old_file": path, "new_file": path, "hunks": [hunk]})
 
     if not staged:
-        untracked = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            cwd=SAFE_ROOT,
-            env=_tool_environment(),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            stdin=subprocess.DEVNULL,
-        )
-        if untracked.returncode == 0:
+        try:
+            untracked = subprocess.run(
+                _sandbox_command(
+                    ["git", "ls-files", "--others", "--exclude-standard"],
+                    shell=False, cwd=root, expose_git_config=True, sandbox_root=root,
+                ),
+                cwd=root, env=_tool_environment(), capture_output=True,
+                encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                timeout=COMMAND_TIMEOUT,
+            )
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            untracked = None
+        if untracked is not None and untracked.returncode == 0:
             for path in untracked.stdout.splitlines():
-                if path.endswith(".py"):
+                if path.endswith(".py") and _is_allowed((root / path).resolve()):
                     changes.append({
                         "old_file": None,
                         "new_file": path,
@@ -662,7 +823,7 @@ def analyze_git_change_impact(staged: bool = False) -> str:
 
     if not changes:
         return "No changed Python files found."
-    graph = DependencyGraph(SAFE_ROOT).build()
+    graph = DependencyGraph(root).build()
     impacts = analyze_change_impact({"diff": changes}, graph)
     return json.dumps(impacts, indent=2) if impacts else "No Git changes found."
 
@@ -675,7 +836,7 @@ def _python_write_error(target: Path, content: str) -> str | None:
     """Reject invalid Python before replacing the file on disk."""
     if target.suffix.lower() != ".py":
         return None
-    relative = target.relative_to(SAFE_ROOT).as_posix()
+    relative = target.relative_to(current_workspace_root()).as_posix()
     try:
         compile(content, relative, "exec", dont_inherit=True)
     except SyntaxError as error:
@@ -874,7 +1035,7 @@ def list_mcp_connections() -> str:
     the private MCP registry with shell commands.
     """
     try:
-        servers = all_mcp_servers(SAFE_ROOT)
+        servers = all_mcp_servers(APP_ROOT)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return f"Error: MCP configuration could not be read: {error}"
     return json.dumps({"servers": [
@@ -908,7 +1069,7 @@ def execute_command(command: str) -> str:
         paths = [part for part in parts[1:] if not part.startswith("-")]
         if len(paths) == 1 and not Path(paths[0]).is_absolute():
             target = _resolve(paths[0])
-            lexical = SAFE_ROOT / paths[0]
+            lexical = current_workspace_root() / paths[0]
             if target is not None and not target.exists() and not lexical.is_symlink():
                 return (
                     f"Error: {paths[0]} is already absent; removal was not run. "
@@ -931,12 +1092,13 @@ def run_tests(test_path: str = ".") -> str:
     target = _resolve(test_path)
     if target is None or not target.exists():
         return ACCESS_DENIED
-    rel = target.relative_to(SAFE_ROOT).as_posix()
+    root = current_workspace_root()
+    rel = target.relative_to(root).as_posix()
     if _module_available("pytest"):
         command = [sys.executable, "-m", "pytest", rel, "-q", "--tb=short"]
     else:
         discover_root = rel if target.is_dir() else str(Path(rel).parent)
-        if rel == "." and (SAFE_ROOT / "tests").is_dir():
+        if rel == "." and (root / "tests").is_dir():
             # unittest does not recurse into a tests/ directory without an
             # __init__.py, unlike pytest. Discover from there explicitly.
             discover_root = "tests"
@@ -1011,14 +1173,14 @@ def run_language_tests(language: str, path: str = ".") -> str:
 
 @tool
 def verify_tool_contract(tool_name: str, test_path: str) -> str:
-    """Verify a local tool is registered and has a passing contract-test file.
+    """Verify a tool definition and its passing contract-test file.
 
-    This checks a separate Python process, so a tool added during the current
-    turn can be verified before the TUI reloads. The test file must contain a
-    call to the tool's invoke method; passing unrelated tests is insufficient.
+    In the source thread, verify Wallace's built-in registry. In an ordinary
+    workspace, verify a local @tool definition without exposing Wallace source.
+    The test must call the tool's invoke method; unrelated tests are not enough.
 
     Args:
-        tool_name: Exact name of a @tool registered in tools.TOOLS.
+        tool_name: Exact name of a registered built-in or a workspace @tool.
         test_path: Python test file relative to the workspace root.
     """
     if not re.fullmatch(r"[a-z][a-z0-9_]*", tool_name):
@@ -1045,38 +1207,79 @@ def verify_tool_contract(tool_name: str, test_path: str) -> str:
     )
     if not exercised:
         return f"Error: a test_ function in {test_path} must call {tool_name}.invoke(...)."
-    registry = _run_command([
-        sys.executable, "-c",
-        "import sys; from tools import TOOLS; sys.exit(0 if sys.argv[1] in {tool.name for tool in TOOLS} else 1)",
-        tool_name,
-    ])
-    if not registry.startswith("Exit code: 0"):
-        return f"Error: {tool_name} is not registered in tools.TOOLS, or the tools module cannot be imported. {registry}"
+    source_thread = current_workspace_root().resolve() == APP_ROOT.resolve()
+    if source_thread:
+        registry = _run_command([
+            sys.executable, "-c",
+            "import sys; from tools import TOOLS; sys.exit(0 if sys.argv[1] in {tool.name for tool in TOOLS} else 1)",
+            tool_name,
+        ])
+        if not registry.startswith("Exit code: 0"):
+            return f"Error: {tool_name} is not registered in tools.TOOLS, or the tools module cannot be imported. {registry}"
+    else:
+        defined = False
+        for directory, directories, files in os.walk(current_workspace_root()):
+            directories[:] = [name for name in directories if name.lower() not in SKIP_DIRS]
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                source = Path(directory) / name
+                try:
+                    resolved = source.resolve()
+                except (OSError, RuntimeError):
+                    continue
+                if not _is_allowed(resolved):
+                    continue
+                try:
+                    if source.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                        continue
+                    module = ast.parse(source.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, SyntaxError):
+                    continue
+                for node in ast.walk(module):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != tool_name:
+                        continue
+                    if any(
+                        isinstance(decorator, ast.Name) and decorator.id == "tool"
+                        or isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name)
+                        and decorator.func.id == "tool"
+                        for decorator in node.decorator_list
+                    ):
+                        defined = True
+                        break
+                if defined:
+                    break
+            if defined:
+                break
+        if not defined:
+            return f"Error: {tool_name} is not defined with @tool in this workspace."
     result = run_tests.invoke({"test_path": test_path})
     if not result.startswith("Exit code: 0"):
         return f"Error: contract tests failed for {tool_name}. {result}"
-    return f"OK: {tool_name} is registered; {test_path} contains a test invocation and its tests pass."
+    if source_thread:
+        return f"OK: {tool_name} is registered; {test_path} contains a test invocation and its tests pass."
+    return (
+        f"OK: workspace tool {tool_name} has a @tool definition and passing contract tests. "
+        "It is not installed in Wallace's built-in registry."
+    )
 
 
 def _module_available(name: str) -> bool:
     """Return whether a Python module can be imported by this interpreter."""
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import importlib.util; import sys; "
-                "sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)"
-            ),
-            name,
-        ],
-        cwd=SAFE_ROOT,
-        env=_tool_environment(),
-        capture_output=True,
-        stdin=subprocess.DEVNULL,
-        timeout=5,
-    )
-    return result.returncode == 0
+    root = current_workspace_root()
+    try:
+        result = subprocess.run(
+            _sandbox_command([
+                sys.executable, "-c",
+                "import importlib.util; import sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
+                name,
+            ], shell=False, cwd=root),
+            cwd=root, env=_tool_environment(), capture_output=True,
+            stdin=subprocess.DEVNULL, timeout=5,
+        )
+        return result.returncode == 0
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1085,8 +1288,23 @@ def _module_available(name: str) -> bool:
 
 @tool
 def get_git_status() -> str:
-    """Show the current branch and which files are modified, staged, or untracked."""
-    return _run_command(["git", "status", "--short", "--branch"])
+    """Show repository-wide Git status, including every untracked file.
+
+    Git inspection uses the repository root even when the current thread's
+    file workspace is the narrower ``workspace/`` directory. If no repository
+    is available, that is a scope limitation, not evidence that the workspace
+    is empty.
+    """
+    root = _git_root()
+    if root is None:
+        return GIT_UNAVAILABLE
+    args = [
+        "git", "status", "--short", "--branch", "--untracked-files=all",
+        "--", ".", *_git_pathspec_excludes(),
+    ]
+    return _run_command(
+        args, cwd=root, expose_git_config=True, sandbox_root=root,
+    )
 
 
 @tool
@@ -1096,14 +1314,39 @@ def get_git_diff(staged: bool = False) -> str:
     Args:
         staged: Show staged changes instead of unstaged ones.
     """
+    root = _git_root()
+    if root is None:
+        return GIT_UNAVAILABLE
     args = ["git", "diff"]
     if staged:
         args.append("--staged")
     # Keep sensitive files out of the diff, matching the read restrictions.
-    excludes = [f":(glob,exclude)**/{pattern}" for pattern in SENSITIVE_PATTERNS]
-    args += ["--", ".", *excludes]
-    result = _run_command(args)
+    args += ["--", ".", *_git_pathspec_excludes()]
+    result = _run_command(
+        args, cwd=root, expose_git_config=True, sandbox_root=root,
+    )
     return "(no changes)" if result == "Exit code: 0" else result
+
+
+def _get_session_status() -> str:
+    """Show this Wallace process's thread, model, trust mode, and reported token use.
+
+    Provider account balance, remaining quota, and reset time are not
+    available from generic model responses. No API keys are read or shown.
+    """
+    return current_status_text()
+
+
+async def _get_session_status_async() -> str:
+    """Run status in the active async turn without crossing thread boundaries."""
+    return current_status_text()
+
+
+get_session_status = StructuredTool.from_function(
+    func=_get_session_status,
+    coroutine=_get_session_status_async,
+    name="get_session_status",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1375,7 @@ TOOLS = [
     get_git_diff,
     get_system_info,
     list_mcp_connections,
+    get_session_status,
 ]
 
 # Explicitly reviewed read-only tools may run without approval. A new local
@@ -1141,7 +1385,7 @@ READ_ONLY_TOOLS = {
     "get_code_symbols", "check_python_syntax", "summarize_project_file",
     "analyze_project_dependencies", "analyze_git_change_impact",
     "get_git_status", "get_git_diff", "get_system_info",
-    "list_mcp_connections",
+    "list_mcp_connections", "get_session_status",
 }
 TOOLS_REQUIRING_APPROVAL = {
     tool.name for tool in TOOLS if tool.name not in READ_ONLY_TOOLS

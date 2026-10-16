@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import shutil
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -11,6 +12,7 @@ from main import (
     EMPTY_RESPONSE_RETRY_PROMPT,
     MALFORMED_TOOL_CALL_RETRY_PROMPT,
     _invoke_with_approvals,
+    _run_host_full_suite,
     describe_error,
     malformed_retry_payload,
     recover_pending_full_suite,
@@ -39,6 +41,23 @@ class FakeAgent:
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
+    @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
+    async def test_host_full_suite_uses_selected_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_example(self):\n"
+                "        self.assertEqual(2 + 2, 4)\n",
+                encoding="utf-8",
+            )
+            with patch("main.current_workspace_root", return_value=root):
+                result = await _run_host_full_suite()
+            self.assertIn("Exit code: 0", result)
+            self.assertIn("Ran 1 test", result)
+
     async def test_host_runs_skipped_full_suite_only_with_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = parse_request(Path(directory), "Verify the code in test_site and run tests")
@@ -94,7 +113,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 "id": "old-suite", "name": "run_tests", "target": "",
                 "outcome": "Exit code: 5", "ok": False,
             }])
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.current_workspace_root", return_value=root):
                 with patch("main._run_host_full_suite", AsyncMock(return_value="Exit code: 0\nRan 1 test\nOK")):
                     summary, activity = await recover_pending_full_suite(
                         plan, [], AsyncMock(return_value=True)
@@ -116,7 +135,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -215,7 +234,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": self.messages})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -254,7 +273,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -280,13 +299,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             def capture_turn(self, prompt, **kwargs):
                 captured.append(prompt)
 
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     with patch.object(AgentTUI, "run_turn", capture_turn):
                         app = AgentTUI()
                         async with app.run_test():
                             app.agent = object()
-                            parse_request(root, "Implement main.py", session_id=app.thread_id)
+                            parse_request(root, "Implement main.py", session_id=f"workspace.{app.thread_id}")
                             app._conversation_history = [
                                 {"role": "user", "content": "Implement main.py"},
                                 {"role": "assistant", "content": "Missing step_id in /workspace."},
@@ -320,7 +339,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -336,7 +355,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tui_marks_nonzero_command_exit_as_failed(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -368,7 +387,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -419,7 +438,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": self.messages})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -446,7 +465,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": [HumanMessage(content="Review main.py")]})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -483,7 +502,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():

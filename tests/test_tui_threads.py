@@ -13,6 +13,7 @@ from textual.theme import Theme
 from textual.widgets import Button, Header
 
 from tui_agent import AgentTUI, ApprovalScreen
+from wallace_planning.threads import ConversationThreadManager
 from wallace_mcp import all_mcp_servers
 from wallace_themes import (
     DARK_ERROR_COLOR,
@@ -28,15 +29,52 @@ from wallace_themes import (
 
 
 class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_running_tui_observes_other_window_thread_and_transcript_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tui_agent.APP_ROOT", root), patch("tui_agent.SAFE_ROOT", root / "workspace"):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        other = ConversationThreadManager(root, scope="workspace")
+                        created = other.create("External thread")
+                        app._refresh_shared_threads()
+                        self.assertIn(created.thread_id, {item[0] for item in app._known_threads})
+                        other.store("main").append("user", "hello from the other window")
+                        app._refresh_shared_threads()
+                        self.assertEqual(app._conversation_history[-1]["content"], "hello from the other window")
+                        other.rename(created.thread_id, "Renamed externally")
+                        app._refresh_shared_threads()
+                        self.assertIn("Renamed externally", {item[1] for item in app._known_threads})
+                        other.remove(created.thread_id)
+                        app._refresh_shared_threads()
+                        self.assertNotIn(created.thread_id, {item[0] for item in app._known_threads})
+
+    async def test_dev_tui_limits_regular_threads_to_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tui_agent.APP_ROOT", root), patch("tui_agent.DEV_MODE", True):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        self.assertEqual(app.thread_id, "wallace_dev")
+                        self.assertEqual(app.workspace_panel.root, root)
+                        app._handle_thread_command("/new test_website")
+                        self.assertEqual(app.workspace_root, root / "workspace")
+                        self.assertEqual(app.workspace_panel.root, root / "workspace")
+                        app._handle_thread_command("/switch wallace_dev")
+                        self.assertEqual(app.workspace_panel.root, root)
+
     async def test_mcp_commands_rebuild_live_agent_and_keep_thread(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
                         app._handle_thread_command("/new mcp-work")
                         app.conversation_store.append("user", "Keep this conversation")
+                        app._conversation_history = app.conversation_store.load()
                         thread_id = app.thread_id
                         app.agent = object()
                         rebuilt = object()
@@ -65,7 +103,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_mcp_rebuild_rolls_back_registry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -79,7 +117,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_switch_and_delete_thread_by_title(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -104,7 +142,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
     async def test_theme_switching_is_saved_and_restored(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     omarchy_theme = Theme(name="omarchy-custom", primary="#aabbcc")
                     with patch("tui_agent.discover_omarchy_themes", return_value=[omarchy_theme]):
@@ -144,7 +182,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             (root / ".wallace").mkdir()
             (root / ".wallace" / "ui.json").write_text(json.dumps({"theme": "wallace-minimal"}))
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 app = AgentTUI()
                 self.assertEqual(app.theme, DEFAULT_THEME)
 
@@ -153,7 +191,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
             root = Path(directory)
             (root / ".wallace").mkdir()
             preference = root / ".wallace" / "ui.json"
-            with patch("tui_agent.SAFE_ROOT", root):
+            with patch("tui_agent.SAFE_ROOT", root), patch("tui_agent.APP_ROOT", root):
                 for old, new in (
                     ("wallace-night-mode", "wallace-night"),
                     ("wallace-red-light", "wallace-red"),
@@ -165,7 +203,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_approval_hint_and_shortcuts_are_visible_and_work(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     decisions: list[bool] = []
@@ -192,7 +230,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_header_shows_local_weekday_date_and_time(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -211,7 +249,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_emoji_focused_theme_opts_into_emoji_sky_icons(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     app.register_theme(Theme(
@@ -229,7 +267,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_startup_and_conversation_turns_have_blank_line_separators(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -262,7 +300,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prompt_has_editor_selection_editing_and_undo_shortcuts(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -334,7 +372,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_red_removes_markdown_syntax_colors(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -377,7 +415,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_grayscale_removes_markdown_syntax_hues(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -402,7 +440,7 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dark_keeps_black_surfaces_and_uses_red_only_for_text_hierarchy(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:

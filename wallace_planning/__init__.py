@@ -10,13 +10,15 @@ from .generators import active_plan, create_plan, list_plans, load_plan, save_pl
 from .models import PlanSpec, PlanStep, SourceRef
 from .quality import response_quality_error
 from .threads import (
-    ConversationThreadManager, ThreadRecord, TRUST_MODES,
-    parse_new_thread_arguments, validate_trust_mode,
+    ConversationThreadManager, DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    ThreadRecord, TRUST_MODES, parse_new_thread_arguments,
+    validate_approval_timeout, validate_trust_mode,
 )
 
 __all__ = [
     "ArchiveManager",
     "ConversationThreadManager",
+    "DEFAULT_APPROVAL_TIMEOUT_SECONDS",
     "PlanExecutor",
     "PlanSpec",
     "PlanStep",
@@ -37,4 +39,5 @@ __all__ = [
     "resume_or_create",
     "save_plan",
     "validate_trust_mode",
+    "validate_approval_timeout",
 ]

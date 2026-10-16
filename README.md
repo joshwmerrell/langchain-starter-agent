@@ -80,7 +80,10 @@ optional, but the model you choose must fit your available memory; see
 [Ollama's GPU guidance](https://docs.ollama.com/gpu) if you want acceleration. You do not
 need Node.js, ESLint, TypeScript, Omarchy, or a separate `watchfiles` install
 just to run the current CLI or TUI. Git is only needed if you must clone the
-source repository first.
+source repository first. On Linux, install your distribution's `bubblewrap`
+package (`bwrap`) for Wallace's command and test tools. If Bubblewrap is
+missing or cannot create its sandbox, those tools fail closed; file tools and
+chat still work. Command tools are not supported on Windows in this version.
 
 1. Install uv and, if using local models, Ollama. These are the commands published by their installers;
    you can use their linked download pages instead if you prefer not to pipe
@@ -156,6 +159,17 @@ Or use the command-line interface:
 uv run main.py
 ```
 
+The selected thread determines file access. Every ordinary thread uses
+`workspace/` inside the project root, even when opened in a development
+launcher. Only the permanent `wallace_dev` thread can use Wallace's source
+tree, and that thread is visible only in development launchers:
+`uv run dev_tui.py`, `uv run dev_cli.py`, or `uv run main.py --dev`.
+On a fresh setup the development TUI starts on `wallace_dev`; later it
+reopens the last selected thread. `wallace_dev` cannot be renamed or removed,
+and normal launchers cannot select it. File, command, test, dependency,
+and editor tools use the selected thread's workspace. `.env` and Wallace's
+private state are masked from model-invoked command tools even in `wallace_dev`.
+
 To verify the Python installation and current code without starting an agent
 turn, run:
 
@@ -199,12 +213,21 @@ For development, start the TUI under an automatic reload watcher:
 uv run dev_tui.py
 ```
 
+For the development CLI, run `uv run dev_cli.py` (or
+`uv run main.py --dev`). Both launchers show the same ordinary threads and
+their conversations. The active selection is remembered separately in each
+launcher so switching in one window does not steal focus in the other. Both
+TUIs refresh shared thread lists and the open conversation about every two
+seconds when idle. Restart already-running TUI instances after upgrading to
+this version so they load the shared-thread behavior.
+
 That command starts Wallace and restarts the TUI when a Python file changes.
 If Wallace is in the middle of a turn or waiting for approval, the reload is
 queued until the turn finishes, so editing a Python file no longer cuts off the
 agent. This is still a process restart rather than an in-place replacement of
-Python classes. Completed TUI turns are restored from
-`.wallace/conversations/` after the restart. Press Ctrl+L to clear both the
+Python classes. Completed ordinary TUI turns are restored from
+`.wallace/workspace_conversations/`; `wallace_dev` uses
+`.wallace/conversations/`. Press Ctrl+L to clear both the
 visible log and the saved conversation. The normal `uv run tui_agent.py`
 command remains unchanged.
 
@@ -251,7 +274,10 @@ You can also copy `wallace_mcp.example.json` to `.wallace/mcp_servers.json` and
 edit it yourself. This currently supports remote URL-based MCP servers, not
 local stdio commands. HTTPS is required except for loopback HTTP. The optional
 `keywords` help Wallace offer server tools for relevant requests. All
-user-added MCP tool calls follow the active thread's trust mode; duplicate tool names are skipped.
+user-added MCP tool calls follow the active thread's trust mode in every
+launcher; duplicate tool names are skipped. MCP servers are external to the
+local workspace sandbox and can have broader access, so enable only servers
+you trust.
 URLs with embedded usernames/passwords, query strings, or fragments are
 rejected; do not put tokens in URL paths either, because Wallace can display
 those paths to the model. Authenticated services need a separately managed
@@ -261,18 +287,15 @@ their code, permissions, and approval prompts before enabling them. Do not
 put API keys in the MCP configuration.
 
 Wallace's model has a read-only tool to view these links and no MCP management
-tool. Its project file-edit tools cannot access `.wallace`. This is not an
-absolute security boundary: shell commands still run as your OS user
-and could modify private files, especially in higher-trust modes. Review trust
-settings and command previews carefully; strict
-protection would require isolating shell execution under a different account
-or sandbox.
+tool. Its project file-edit tools cannot access `.wallace`. Command and test
+tools use a Bubblewrap mount sandbox, but this is not a substitute for a
+separate OS account or VM against all possible local services and exploits.
 
 Type a question at the `Input:` prompt. For example:
 
 - `Search the LangChain docs for how to create an agent with tools.`
 - `List the files in the project root.`
-- `Read main.py and explain how the agent starts.`
+- In `wallace_dev`: `Read main.py and explain how the agent starts.`
 - `Write a short note to test.md.`
 
 In the CLI, type `exit` or send EOF to quit; in the TUI, press Ctrl+Q.
@@ -287,29 +310,35 @@ current thread. Use `/remove <id or title>` (or `/delete`) to remove a thread;
 Wallace keeps the last remaining thread. The CLI also accepts
 `--thread-id <id>` or `--new-thread --thread-title "Title" --trust-mode MODE`.
 Use `/trust` to see the current thread's mode and `/trust <mode>` to change it.
+Use `/trust informed-trust 15` to set that thread's auto-approval countdown
+to 15 seconds (whole seconds from 1 to 300). `/trust informed-trust` resets
+it to the five-second default. The choice is saved with the thread.
 Every new thread, including one created without an explicit mode, starts in
 `no-trust`. The current mode is shown on startup, after switching threads, and
 in the thread list. It persists across restarts. Wallace's model has no
-dedicated trust-setting tool. Higher-trust shell access under the same OS user
-is not a hard security boundary around Wallace's private state.
+dedicated trust-setting tool. Trust mode changes approval behavior, not the
+per-thread workspace boundary.
 
 - `no-trust`: each approval-required action waits for your Y/N decision.
-- `informed-trust`: the action preview counts down for 10 seconds and then
+- `informed-trust`: the action preview counts down for 5 seconds by default and then
   approves automatically. Moving/hovering the mouse, clicking, scrolling, or
   pressing a key pauses the TUI countdown indefinitely so you can decide with
   Y/N. In the CLI, any key pauses it; the CLI does not receive mouse hover.
 - `yes-trust`: approval-required tools run without a prompt. This includes
-  file changes, shell commands, tests, and configured MCP tools. Shell and MCP
-  tools can access data under your OS account; use this mode only when you
-  trust the model and connected tools. A cloud model can still request a shell
-  command that reads local credentials even though Wallace does not put API
-  keys directly in model messages.
-Existing `.wallace/conversation.json` history is
-migrated into the default `main` thread the first time Wallace starts.
-Wallace remembers the last selected thread in
-`.wallace/conversations/.active-thread.json` and reopens it after a normal
-restart or development reload. An explicit CLI thread flag overrides the
-saved selection. If the saved thread was removed, Wallace falls back to `main`.
+  file changes, shell commands, tests, and configured MCP tools. Use this mode
+  only when you trust the model and connected tools.
+  The Bubblewrap boundary still applies to shell and test commands, but it
+  does not make the whole OS account or external services safe.
+Older ordinary threads from `.wallace/conversations/` are copied once into
+the shared `.wallace/workspace_conversations/` store without deleting the
+originals. If an old `main` conflicts with the newer ordinary `main`, it is
+preserved as `legacy_main`. Only `wallace_dev` remains in the development-only
+store. Previously saved conversations may still mention source files that
+were visible before this boundary changed; the new boundary governs fresh tool
+access, not historical transcript text. A normal session cannot select the
+development thread. An explicit CLI thread
+flag overrides the saved selection; if a saved ordinary thread was removed,
+Wallace falls back to `main`.
 
 In the TUI input bar, press Up and Down to browse previous inputs from the
 active thread. Your unfinished draft is restored when you move back past the
@@ -357,6 +386,17 @@ for a local model, `/model openai:<model-id>`, or
 the current conversation thread and history. Invalid local names and failed
 model setup leave the previous selection unchanged.
 
+Use `/status` in the CLI or TUI to see the current thread, model, trust mode,
+workspace, and provider-reported input/output token totals collected by this
+running Wallace process. Wallace's read-only `get_session_status` tool can
+answer the same question in chat. The counter works with any future model
+provider whose LangChain response includes token-usage metadata; it is not
+limited to OpenAI or Gemini. Counts reset when Wallace restarts and can be
+incomplete if a provider omits usage metadata. They do **not** show a cloud
+account's remaining balance, rolling rate-limit headroom, or reset time;
+check that provider's usage dashboard for those values. `/status` never
+reads or displays API-key values.
+
 To use cloud models without entering a key each time, create a `.env` file in
 the project root with the provider keys you need:
 
@@ -369,8 +409,17 @@ Wallace loads these exact variable names on startup. Existing environment
 variables take precedence over values in `.env`. The `.env` file is ignored by
 Git; keep it private and never commit or paste real keys into chat. Restart
 Wallace after changing `.env`. If a selected provider's key is missing, Wallace
-asks for it in a masked TUI dialog or a no-echo CLI prompt. `/key` temporarily
-overrides the selected provider's configured key for the current session.
+asks for it in a masked TUI dialog or a no-echo CLI prompt. Press F12 or use
+`/keys` to list provider key names and whether they are active; values are
+never displayed. `/key add <name> <openai|gemini>` opens a masked prompt and
+saves the value in the operating system's keyring. `/key on <name>`,
+`/key off <name>`, and `/key remove <name>` manage those saved keys. Only one
+key per provider can be active. `.env` keys appear as
+`environment-openai` and `environment-gemini`; they can be toggled but cannot
+be deleted through Wallace—remove them from `.env` or your environment
+yourself. `/key session` enters a temporary key for the selected cloud model.
+Keyring-backed keys need an available, unlocked OS keyring; Wallace does not
+fall back to storing their values in its metadata file.
 The key is passed to the provider client for HTTP authentication; Wallace does
 not intentionally include it in model messages, tool schemas, or conversation
 files. Keys typed in the masked prompt are kept only for that process. The CLI
@@ -380,10 +429,12 @@ Cloud requests send conversation content and relevant tool interactions to the
 provider and may incur charges. Wallace still exposes approved command, test,
 and file-edit tools in cloud mode, as requested. These run under your OS user
 and can potentially read local secrets or alter code that hot-reloads; a
-masked key prompt and scrubbed subprocess environment reduce accidental leaks
-but are **not an isolation boundary**. Review each approval carefully. Strong
-protection against a malicious model would require a separately isolated
-credential broker and sandbox. See the [official OpenAI API authentication
+masked key prompt, scrubbed subprocess environment, and Bubblewrap sandbox
+reduce exposure but are **not a perfect same-user security boundary**. The
+host process must hold each active key to call its provider, and local services
+or future integrations could still introduce leaks. Review approvals carefully;
+strong isolation would require a separate credential broker and OS account or
+VM. See the [official OpenAI API authentication
 guidance](https://developers.openai.com/api/reference/overview#authentication)
 and [sandbox security guidance](https://developers.openai.com/api/docs/guides/agents-api/environments/security).
 

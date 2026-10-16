@@ -208,6 +208,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                 "User asked for a button.",
                 [{"role": "assistant", "content": "I made the button blue."}],
                 400,
+                model_name="local:test",
             )
             self.assertIn("blue button", summary)
             self.assertEqual(model_type.return_value.ainvoke.await_count, 1)
@@ -228,7 +229,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": []})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -249,7 +250,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tui_answers_local_date_without_asking_model(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test() as pilot:
@@ -286,7 +287,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": []})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -319,7 +320,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": []})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():
@@ -337,12 +338,12 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_answers_date_without_model_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 with patch("main.setup_agent", new=AsyncMock(return_value=(object(), {}))):
                     with patch("builtins.input", side_effect=["What is today's date?", "exit"]):
                         with patch("main.console"):
                             await run_agent()
-            history = ConversationThreadManager(root).store("main").load_all()
+            history = ConversationThreadManager(root, scope="workspace").store("main").load_all()
             self.assertEqual(len(history), 2)
             self.assertIn("Today is ", history[1]["content"])
 
@@ -362,11 +363,11 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            store = ConversationThreadManager(root).store("main")
+            store = ConversationThreadManager(root, scope="workspace").store("main")
             store.append("user", "Who are you?")
             store.append("assistant", previous)
             agent = FakeAgent()
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 with patch("main.setup_agent", new=AsyncMock(return_value=(agent, {}))):
                     with patch("builtins.input", side_effect=["What is 2+2?", "exit"]):
                         with patch("main.console"):
@@ -391,7 +392,7 @@ class MemoryTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(values={"messages": []})
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch("tui_agent.SAFE_ROOT", Path(directory)):
+            with patch("tui_agent.SAFE_ROOT", Path(directory)), patch("tui_agent.APP_ROOT", Path(directory)):
                 with patch.object(AgentTUI, "initialize_agent", lambda self: None):
                     app = AgentTUI()
                     async with app.run_test():

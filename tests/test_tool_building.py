@@ -40,7 +40,7 @@ class ToolBuildingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "example.py").write_text("one\ntwo\n")
-            with patch("tools.SAFE_ROOT", root):
+            with patch("tools.SAFE_ROOT", root), patch("tools.APP_ROOT", root):
                 prompt = format_action_request({
                     "name": "edit_file_lines",
                     "args": {"path": "example.py", "start_line": 2, "end_line": 2, "new_text": "three"},
@@ -219,7 +219,7 @@ class ToolBuildingTests(unittest.TestCase):
             root = Path(directory)
             test = root / "test_new_tool.py"
             test.write_text("def test_unrelated():\n    assert True\n")
-            with patch("tools.SAFE_ROOT", root):
+            with patch("tools.SAFE_ROOT", root), patch("tools.APP_ROOT", root):
                 self.assertIn("must call new_tool.invoke", verify_tool_contract.invoke({
                     "tool_name": "new_tool", "test_path": test.name,
                 }))
@@ -267,7 +267,7 @@ class MCPAndSelectionTests(unittest.TestCase):
             clear_connection_statuses()
             add_mcp_server(root, "files", "https://example.com/mcp", ("drive",))
             set_connection_status("files", True)
-            with patch("tools.SAFE_ROOT", root):
+            with patch("tools.SAFE_ROOT", root), patch("tools.APP_ROOT", root):
                 listed = json.loads(list_mcp_connections.invoke({}))
             self.assertEqual(listed["servers"][0]["name"], "langchain-docs")
             self.assertEqual(listed["servers"][1]["url"], "https://example.com/mcp")
@@ -282,7 +282,7 @@ class MCPAndSelectionTests(unittest.TestCase):
                     "path": ".wallace/mcp_servers.json", "content": "{}",
                 }))
             set_mcp_server_active(root, "files", False)
-            with patch("tools.SAFE_ROOT", root):
+            with patch("tools.SAFE_ROOT", root), patch("tools.APP_ROOT", root):
                 listed = json.loads(list_mcp_connections.invoke({}))
             self.assertEqual(listed["servers"][1]["connection"], "inactive")
             clear_connection_statuses()
@@ -361,7 +361,7 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
     async def test_cli_mcp_commands_rebuild_and_persist_choice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("main.__file__", str(root / "main.py")):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
                 setup = AsyncMock(return_value=(object(), {"thread": "new"}))
                 with patch("main.setup_agent", new=setup):
                     with patch("builtins.input", side_effect=[
@@ -378,7 +378,7 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             set_mcp_server_active(root, "langchain-docs", False)
-            with patch("main.__file__", str(root / "main.py")), patch("main.MCPAdapter") as adapter:
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root), patch("main.MCPAdapter") as adapter:
                 from main import _load_docs_tools
 
                 self.assertEqual(await _load_docs_tools(lambda warning: self.fail(warning)), [])
@@ -408,7 +408,7 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
                 async def list_tools(self):
                     return [SimpleNamespace(name="list_files", metadata={})]
 
-            with patch("main.__file__", str(root / "main.py")), patch("main.MCPAdapter", Adapter):
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root), patch("main.MCPAdapter", Adapter):
                 tools = await _load_configured_mcp_tools(lambda warning: self.fail(warning))
             self.assertEqual(seen, ["https://example.com/mcp"])
             self.assertEqual(tools[0].metadata["wallace_mcp"]["keywords"], ("drive", "files"))
@@ -437,7 +437,7 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
         remote = SimpleNamespace(name="list_remote_files", metadata={
             "wallace_mcp": {"server": "remote", "keywords": ("remote",)},
         })
-        with patch("main._load_docs_tools", new=AsyncMock(return_value=[])):
+        with patch("main.DEV_MODE", True), patch("main._load_docs_tools", new=AsyncMock(return_value=[])):
             with patch("main._load_configured_mcp_tools", new=AsyncMock(return_value=[remote])):
                 with patch("main.ChatOllama"):
                     with patch("main.create_agent", return_value=object()) as create:

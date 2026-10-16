@@ -15,7 +15,7 @@ _PATH_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za
 _INTENTS = (
     ("implement", ("implement", "build", "add", "create", "develop")),
     ("fix", ("fix", "repair", "bug", "debug")),
-    ("review", ("review", "inspect", "audit", "look at", "describe")),
+    ("review", ("review", "inspect", "audit", "diagnose", "look at", "describe")),
     ("refactor", ("refactor", "restructure", "clean up")),
     ("test", ("test", "verify", "validate")),
     ("research", ("research", "look up", "compare")),

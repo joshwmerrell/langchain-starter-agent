@@ -17,6 +17,9 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 
+if __name__ == "__main__" and "--dev" in sys.argv:
+    os.environ["WALLACE_DEV_MODE"] = "1"
+
 import httpx
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -50,7 +53,8 @@ except ImportError as _error:
 
 from tools import (
     MAX_OUTPUT_CHARS, TEST_TIMEOUT, TOOLS, TOOLS_REQUIRING_APPROVAL,
-    _tool_environment, _truncate_middle, preview_line_edit, preview_write,
+    _tool_environment, _truncate_middle, current_workspace_root,
+    preview_line_edit, preview_write, reset_active_workspace, set_active_workspace,
 )
 from wallace_mcp import (
     BUILTIN_NAME,
@@ -71,6 +75,7 @@ from wallace_tool_selection import select_tools
 from wallace_planning import (
     ArchiveManager,
     ConversationThreadManager,
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
     TRUST_MODES,
     continuation_instruction,
     parse_new_thread_arguments,
@@ -78,8 +83,10 @@ from wallace_planning import (
     response_quality_error,
     resume_or_create,
     save_plan,
+    validate_approval_timeout,
     validate_trust_mode,
 )
+from wallace_planning.threads import thread_file_lock
 from wallace_models import (
     CloudCredentials,
     MissingCredentialError,
@@ -89,14 +96,17 @@ from wallace_models import (
     list_installed_models,
     parse_model_selection,
     save_model_choice,
-    use_environment_key,
+    use_active_key,
 )
+from wallace_runtime import APP_ROOT, DEV_MODE, WORKSPACE_ROOT, ensure_workspace, plan_session_id, thread_workspace
+from wallace_keys import add_key, list_keys, parse_key_command, remove_key, set_key_active
+from wallace_status import SessionUsage, StatusContext, bind_status, reset_status
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(APP_ROOT / ".env")
 
 console = Console()
 
-CONVERSATION_PATH = Path(__file__).resolve().parent / ".wallace" / "conversation.json"
+CONVERSATION_PATH = APP_ROOT / ".wallace" / "conversation.json"
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -276,6 +286,10 @@ MCP endpoints and active states belong to the user. You may call
 manages them with TUI /mcp commands; never attempt to edit the private MCP
 registry with a shell command or project file tool.
 
+Use `get_session_status` for this Wallace process's provider-reported token
+usage. It does not know the provider's remaining account quota or reset time;
+never claim those values without a provider-specific source.
+
 CRITICAL INSTRUCTION:
 Whenever you invoke a tool, wait for its result before deciding the next step.
 Use further tools when the request still requires implementation or validation;
@@ -289,6 +303,17 @@ command or tests, checking Python syntax, reviewing Git changes, or looking up
 LangChain documentation. Do not claim you cannot access project files when a
 tool can; call the tool and use its result. If a tool fails or is unavailable,
 say so clearly instead of guessing.
+
+The selected workspace is the scope for the current thread. An ordinary
+thread works inside `workspace/`, where a README or other user files may exist
+even though `.git` is absent. Treat a missing Git repository as an optional
+Git-status limitation, not as evidence that the workspace is empty or
+unavailable. When the user mentions `workspace/` from an ordinary thread,
+inspect the current root with `get_project_tree` and read `README.md` directly;
+do not prepend `workspace/` to paths that are already relative to that root.
+The read-only Git tools are an explicit exception: they inspect the repository
+root so they can report tracked, modified, deleted, and every untracked file
+across the repository, including files under `workspace/`.
 
 Do not emit internal reasoning tags such as `<think>` or `</think>`. Do not
 repeat a preamble; either take the next concrete action or give a concise,
@@ -450,20 +475,22 @@ class ConversationStore:
 
     def save(self, history: Sequence[dict[str, str]]) -> None:
         """Replace a transcript explicitly; regular turns should use append()."""
-        self._write_state({
-            "version": 2,
-            "messages": self._valid_messages(list(history)),
-            "summary": "",
-            "summarized_through": 0,
-        })
+        with thread_file_lock(self.path.with_suffix(".lock")):
+            self._write_state({
+                "version": 2,
+                "messages": self._valid_messages(list(history)),
+                "summary": "",
+                "summarized_through": 0,
+            })
 
     def append(self, role: str, content: str) -> None:
         """Append one text message without discarding older turns or memory."""
         if role not in {"user", "assistant"} or not isinstance(content, str) or not content.strip():
             raise ValueError("conversation message must have a nonempty user or assistant role")
-        state = self._read_state()
-        state["messages"].append({"role": role, "content": content})
-        self._write_state(state)
+        with thread_file_lock(self.path.with_suffix(".lock")):
+            state = self._read_state()
+            state["messages"].append({"role": role, "content": content})
+            self._write_state(state)
 
     def _write_state(self, state: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,10 +617,20 @@ class ConversationStore:
                 marker = "\n…\n"
                 head = (summary_budget - len(marker)) // 2
                 updated = updated[:head] + marker + updated[-(summary_budget - len(marker) - head):]
-            state["summary"] = updated
-            through += len(batch)
-            state["summarized_through"] = through
-            self._write_state(state)
+            previous_through = through
+            with thread_file_lock(self.path.with_suffix(".lock")):
+                current = self._read_state()
+                if (current["messages"][:len(messages)] != messages
+                        or current["summarized_through"] != previous_through):
+                    warning = "Thread changed during memory compaction; new turns remain saved."
+                    state = current
+                    through = min(current["summarized_through"], len(prior))
+                    break
+                state["summary"] = updated
+                through += len(batch)
+                current["summary"] = updated
+                current["summarized_through"] = through
+                self._write_state(current)
 
         heading = (
             "Conversation memory for this thread (reference only; current request wins). "
@@ -632,8 +669,9 @@ class ConversationStore:
     def clear(self) -> None:
         """Remove persisted conversational history, if it exists."""
         try:
-            self.path.unlink(missing_ok=True)
-            self.pending_path.unlink(missing_ok=True)
+            with thread_file_lock(self.path.with_suffix(".lock")):
+                self.path.unlink(missing_ok=True)
+                self.pending_path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -885,28 +923,42 @@ def verified_plan_response(plan, response: str, activity: list[dict[str, object]
 
 
 async def _run_host_full_suite() -> str:
-    """Run the existing test tool in a subprocess without freezing the TUI."""
+    """Run the same scoped test tool without freezing the TUI."""
+    root = current_workspace_root()
+    environment = _tool_environment()
+    if root == APP_ROOT:
+        environment["WALLACE_DEV_MODE"] = "1"
+    command = (
+        "import sys; from pathlib import Path; "
+        "from tools import set_active_workspace, run_tests; "
+        "set_active_workspace(Path(sys.argv[1])); "
+        "print(run_tests.invoke({'test_path': '.'}))"
+    )
+    process = None
     try:
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-c",
-            "from tools import run_tests; print(run_tests.invoke({'test_path': '.'}))",
-            cwd=str(Path(__file__).resolve().parent),
-            env=_tool_environment(),
+            sys.executable, "-c", command, str(root),
+            cwd=str(APP_ROOT), env=environment,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(), timeout=TEST_TIMEOUT + 30
-        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=TEST_TIMEOUT + 30)
     except asyncio.TimeoutError:
-        process.kill()
-        await process.communicate()
+        if process is not None:
+            process.kill()
+            await process.communicate()
         return "Error: full-suite host runner timed out."
-    except OSError:
+    except (OSError, RuntimeError):
         return "Error: full-suite host runner could not start."
     output = stdout.decode("utf-8", errors="replace").strip()
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        return _truncate_middle(
+            f"Error: full-suite host runner exited with code {process.returncode}. {detail}",
+            MAX_OUTPUT_CHARS,
+        )
     if not output.startswith(("Exit code:", "Error:")):
-        return f"Error: full-suite host runner failed (exit code {process.returncode})."
+        return "Error: full-suite host runner did not return a test result."
     return _truncate_middle(output, MAX_OUTPUT_CHARS)
 
 
@@ -959,7 +1011,7 @@ async def recover_pending_full_suite(
         detail = event.get("diagnostic") or event.get("outcome") or "failed"
         summary = f"Full project tests did not pass ({detail})."
     if re.search(r"\btest[-_]site\b", str(plan.request), re.IGNORECASE):
-        site = Path(__file__).resolve().parent / "test_site"
+        site = current_workspace_root() / "test_site"
         absent = not site.exists()
         observed.append({
             "id": f"host-absence-{uuid.uuid4().hex}",
@@ -1126,7 +1178,7 @@ def new_thread_config() -> dict:
 async def _load_docs_tools(notify: Callable[[str], None]) -> list:
     """Load LangChain documentation tools over MCP; failure is non-fatal."""
     try:
-        if not read_mcp_configuration(Path(__file__).resolve().parent).get("langchain_docs_enabled", True):
+        if not read_mcp_configuration(APP_ROOT).get("langchain_docs_enabled", True):
             return []
     except (OSError, ValueError) as error:
         notify(f"Could not read LangChain MCP preference: {error}; using the built-in default.")
@@ -1167,7 +1219,7 @@ async def _load_docs_tools(notify: Callable[[str], None]) -> list:
 async def _load_configured_mcp_tools(notify: Callable[[str], None]) -> list:
     """Load user-configured endpoints; every returned tool needs approval."""
     try:
-        servers = load_mcp_servers(Path(__file__).resolve().parent)
+        servers = load_mcp_servers(APP_ROOT)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         notify(f"MCP configuration was not loaded: {error}")
         return []
@@ -1258,11 +1310,11 @@ async def setup_agent(
     so a TUI can show them without printing over its own screen."""
     notify = on_status or _default_status
 
-    selected_model = model_name or load_model_choice(Path(__file__).resolve().parent, OLLAMA_MODEL)
+    selected_model = model_name or load_model_choice(APP_ROOT, OLLAMA_MODEL)
     model = _chat_model(selected_model, credentials)
     clear_connection_statuses()
     docs_tools, configured_tools = await asyncio.gather(
-        _load_docs_tools(notify), _load_configured_mcp_tools(notify)
+        _load_docs_tools(notify), _load_configured_mcp_tools(notify),
     )
     tools = list(TOOLS)
     registered = {tool.name for tool in tools}
@@ -1283,7 +1335,14 @@ async def setup_agent(
     approval_required = approval_policy(configured_names)
     agent = create_agent(
         model=model,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + (
+            "\nLocal tools are scoped to the selected thread's workspace. "
+            "Only the permanent wallace_dev thread in a development launcher "
+            "can work on Wallace's source tree. Every other thread works in "
+            "workspace/ and must not claim access to Wallace's source. A "
+            "missing .git directory in that workspace must not stop file "
+            "inspection or reading its README."
+        ),
         tools=tools,
         middleware=[focus_tools_on_request, HumanInTheLoopMiddleware(interrupt_on=approval_required)],
         checkpointer=InMemorySaver(),  # required for approvals (pause/resume)
@@ -1299,6 +1358,7 @@ async def summarize_thread_memory(
     *,
     model_name: str | None = None,
     credentials: CloudCredentials | None = None,
+    usage_tracker: SessionUsage | None = None,
 ) -> str:
     """Use the selected model without tools to roll older turns into memory."""
     input_budget = MAX_MEMORY_CHARS
@@ -1327,6 +1387,8 @@ async def summarize_thread_memory(
             f"Older turns to incorporate:\n{exchange}"
         )},
     ])
+    if usage_tracker is not None:
+        usage_tracker.record_message(result, selected_model)
     summary = _content_text(result.content)
     if summary is None or response_quality_error(summary):
         raise ValueError("memory summarizer did not return a usable summary")
@@ -1342,6 +1404,7 @@ def _ask_cli_approval(
     model_name: str | None = None,
     credentials: CloudCredentials | None = None,
     trust_mode: str = "no-trust",
+    approval_timeout_seconds: int = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
 ) -> bool:
     trust_mode = validate_trust_mode(trust_mode)
     if trust_mode == "yes-trust":
@@ -1360,12 +1423,13 @@ def _ask_cli_approval(
         )
     )
     if trust_mode == "informed-trust":
+        approval_timeout_seconds = validate_approval_timeout(approval_timeout_seconds)
         if not sys.stdin.isatty() or termios is None or tty is None:
             console.print("[yellow]Interactive countdown unavailable; action rejected.[/yellow]")
             return False
         descriptor = sys.stdin.fileno()
         original = termios.tcgetattr(descriptor)
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + approval_timeout_seconds
         choice = None
         try:
             tty.setcbreak(descriptor)
@@ -1381,7 +1445,7 @@ def _ask_cli_approval(
             termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
             console.print(" " * 65, end="\r")
         if choice is None:
-            console.print("[yellow]Approved after 10 seconds of no interaction.[/yellow]")
+            console.print(f"[yellow]Approved after {approval_timeout_seconds} seconds of no interaction.[/yellow]")
             return True
         if choice.lower() == "y":
             return True
@@ -1395,7 +1459,8 @@ def _print_threads(manager: ConversationThreadManager, current_id: str) -> None:
     console.print("[cyan]Conversation threads[/cyan]")
     for record in manager.list_threads():
         marker = "*" if record.thread_id == current_id else " "
-        console.print(f"{marker} {record.thread_id}: {record.title} ({record.trust_mode})")
+        timeout = f", {record.approval_timeout_seconds}s" if record.trust_mode == "informed-trust" else ""
+        console.print(f"{marker} {record.thread_id}: {record.title} ({record.trust_mode}{timeout})")
 
 
 CLOUD_KEY_WARNING = (
@@ -1436,7 +1501,8 @@ async def list_models_for_provider(provider: str, credentials: CloudCredentials)
     """List local or account-visible cloud models using configured credentials."""
     if provider == "ollama":
         return await list_installed_models(OLLAMA_BASE_URL)
-    secret = credentials.get(provider) or environment_key(provider)
+    from wallace_keys import active_key
+    secret = credentials.get(provider) or active_key(APP_ROOT, provider)
     if secret is None:
         raise MissingCredentialError(provider)
     return await list_cloud_models(provider, secret)
@@ -1471,13 +1537,17 @@ def _handle_thread_command(
         elif action == "/trust":
             if len(parts) == 1:
                 record = manager.resolve(current_id)
-                console.print(f"[cyan]Trust: {record.trust_mode}. Modes: {', '.join(TRUST_MODES)}.[/cyan]")
-            elif len(parts) == 2:
-                record = manager.set_trust_mode(current_id, parts[1])
-                console.print(f"[yellow]Trust mode for {record.title}: {record.trust_mode}. "
+                timeout = f" ({record.approval_timeout_seconds}s)" if record.trust_mode == "informed-trust" else ""
+                console.print(f"[cyan]Trust: {record.trust_mode}{timeout}. Modes: {', '.join(TRUST_MODES)}.[/cyan]")
+            elif len(parts) in {2, 3}:
+                record = manager.set_trust_mode(
+                    current_id, parts[1], parts[2] if len(parts) == 3 else None
+                )
+                timeout = f" ({record.approval_timeout_seconds}s)" if record.trust_mode == "informed-trust" else ""
+                console.print(f"[yellow]Trust mode for {record.title}: {record.trust_mode}{timeout}. "
                               "Higher-trust modes may execute commands and access files without an explicit approval.[/yellow]")
             else:
-                raise ValueError("use /trust [no-trust|informed-trust|yes-trust]")
+                raise ValueError("use /trust [no-trust|informed-trust [SECONDS]|yes-trust]")
         elif action == "/rename" and len(parts) >= 2:
             record = manager.rename(current_id, " ".join(parts[1:]))
             console.print(f"[green]Renamed current thread to: {record.title}[/green]")
@@ -1492,7 +1562,7 @@ def _handle_thread_command(
             console.print("[green]Current thread history cleared.[/green]")
         else:
             console.print(
-                "[yellow]Thread commands: /threads, /new [--trust MODE] [title], /trust [MODE], "
+                "[yellow]Thread commands: /threads, /new [--trust MODE] [title], /trust [MODE [SECONDS]], "
                 "/switch <id or title>, /rename <title>, /remove <id or title>, /clear[/yellow]"
             )
     except (OSError, ValueError) as error:
@@ -1508,6 +1578,8 @@ async def _invoke_with_approvals(
     model_name: str | None = None,
     credentials: CloudCredentials | None = None,
     trust_mode: str = "no-trust",
+    approval_timeout_seconds: int = DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    usage_tracker: SessionUsage | None = None,
 ) -> dict:
     """Run one turn, pausing for approval whenever the agent asks for it."""
     payload = {"messages": [{"role": "user", "content": prompt}]}
@@ -1528,11 +1600,15 @@ async def _invoke_with_approvals(
                 )
                 continue
             raise
+        if usage_tracker is not None:
+            usage_tracker.record_messages(result.get("messages") or [], model_name or "unknown")
         requests = extract_action_requests(result.get("__interrupt__"))
         if not requests:
             return result
         decisions = [
-            make_decision(_ask_cli_approval(request, model_name, credentials, trust_mode))
+            make_decision(_ask_cli_approval(
+                request, model_name, credentials, trust_mode, approval_timeout_seconds
+            ))
             for request in requests
         ]
         payload = resume_command(decisions)
@@ -1547,10 +1623,14 @@ async def run_agent(
     thread_title: str | None = None,
     trust_mode: str = "no-trust",
 ) -> None:
+    ensure_workspace()
     project_root = Path(__file__).resolve().parent
     ArchiveManager(project_root).run_at_session_boundary()
     console.print("[cyan]Wallace planning is active for every request.[/cyan]")
-    thread_manager = ConversationThreadManager(project_root)
+    thread_manager = ConversationThreadManager(
+        project_root, scope="development" if DEV_MODE else "workspace"
+    )
+    thread_manager.ensure("wallace_dev" if DEV_MODE else "main")
     selected_id = thread_id or session_id or thread_manager.active_thread_id()
     if new_thread:
         selected_id = thread_manager.create(thread_title, trust_mode=trust_mode).thread_id
@@ -1559,6 +1639,10 @@ async def run_agent(
     thread_manager.select_thread(selected_id)
     conversation_store = thread_manager.store(selected_id)
     conversation_history = conversation_store.load()
+    workspace_token = set_active_workspace(thread_workspace(
+        selected_id, project_root=project_root, development=DEV_MODE,
+    ))
+    console.print(f"[cyan]Workspace: {escape(str(current_workspace_root()))}[/cyan]")
     console.print(
         f"[cyan]Conversation thread: {selected_id} "
         f"(trust: {thread_manager.resolve(selected_id).trust_mode})[/cyan]"
@@ -1568,7 +1652,7 @@ async def run_agent(
     startup_provider, _ = parse_model_selection(selected_model)
     if startup_provider != "ollama":
         console.print(f"[yellow]{escape(CLOUD_KEY_WARNING)}[/yellow]")
-        if not use_environment_key(credentials, startup_provider) and not _prompt_cli_key(credentials, startup_provider):
+        if not use_active_key(credentials, startup_provider, project_root) and not _prompt_cli_key(credentials, startup_provider):
             console.print("[yellow]No cloud key entered; using the local default for this session.[/yellow]")
             selected_model = OLLAMA_MODEL
     with console.status("Starting agent..."):
@@ -1576,8 +1660,25 @@ async def run_agent(
             model_name=selected_model, credentials=credentials
         )
     console.print(f"[cyan]Model: {escape(selected_model)}[/cyan]")
+    session_usage = SessionUsage()
+    current_record = thread_manager.resolve(selected_id)
+    status_context = StatusContext(
+        usage=session_usage,
+        thread_id=selected_id,
+        model_name=selected_model,
+        trust_mode=current_record.trust_mode,
+        approval_timeout_seconds=current_record.approval_timeout_seconds,
+        workspace=current_workspace_root(),
+    )
+    status_token = bind_status(status_context)
 
     while True:
+        current_record = thread_manager.resolve(selected_id)
+        status_context.thread_id = selected_id
+        status_context.model_name = selected_model
+        status_context.trust_mode = current_record.trust_mode
+        status_context.approval_timeout_seconds = current_record.approval_timeout_seconds
+        status_context.workspace = current_workspace_root()
         print("\n-------- User ---------")
         try:
             prompt = input("Input: ")
@@ -1589,6 +1690,72 @@ async def run_agent(
             continue
 
         if prompt.startswith("/"):
+            if prompt.strip().lower() == "/status":
+                console.print(Text(status_context.render()))
+                continue
+            if prompt.split(maxsplit=1)[0].lower() in {"/key", "/keys"}:
+                try:
+                    parts = shlex.split(prompt)
+                    if parts[1:] == ["session"]:
+                        provider, _ = parse_model_selection(selected_model)
+                        if provider == "ollama":
+                            raise ValueError("select an openai or gemini model first")
+                        temporary = CloudCredentials()
+                        if not _prompt_cli_key(temporary, provider):
+                            continue
+                        selected_secret = temporary.get(provider)
+                        credentials.set(provider, selected_secret.get_secret_value())
+                        temporary.clear()
+                        agent = None
+                        with console.status("Updating cloud model credentials..."):
+                            agent, thread_config = await setup_agent(
+                                model_name=selected_model, credentials=credentials
+                            )
+                        console.print("[green]Temporary session key activated.[/green]")
+                        continue
+                    operation, name, provider = parse_key_command(parts[1:])
+                    if operation == "list":
+                        console.print("[cyan]API keys (values never shown):[/cyan]")
+                        for entry in list_keys(project_root):
+                            status = "active" if entry.enabled and entry.available else (
+                                "unavailable" if not entry.available else "inactive"
+                            )
+                            console.print(f"  {escape(entry.name)} [{entry.provider}, {entry.source}] — {status}")
+                        console.print("Use /key add <name> <openai|gemini>, /key on|off|remove <name>. Environment keys cannot be deleted here.")
+                        continue
+                    if operation == "add":
+                        temporary = CloudCredentials()
+                        if not _prompt_cli_key(temporary, provider):
+                            continue
+                        secret = temporary.get(provider)
+                        add_key(project_root, name, provider, secret.get_secret_value())
+                        temporary.clear()
+                        affected = provider
+                    else:
+                        entry = next((item for item in list_keys(project_root) if item.name.casefold() == name.casefold()), None)
+                        if entry is None:
+                            raise ValueError("unknown API key name")
+                        affected = entry.provider
+                        if operation == "remove":
+                            remove_key(project_root, name)
+                        else:
+                            set_key_active(project_root, name, operation == "on")
+                    credentials.clear(affected)
+                    selected_provider, _ = parse_model_selection(selected_model)
+                    if selected_provider == affected:
+                        if use_active_key(credentials, affected, project_root):
+                            agent = None
+                            with console.status("Updating cloud model credentials..."):
+                                agent, thread_config = await setup_agent(
+                                    model_name=selected_model, credentials=credentials
+                                )
+                        else:
+                            agent = None
+                            console.print("[yellow]Current cloud model has no active key; enable a key or switch models.[/yellow]")
+                    console.print(f"[green]API key {operation} completed for {escape(name)}.[/green]")
+                except (OSError, RuntimeError, ValueError) as error:
+                    console.print(f"[yellow]API key command failed: {escape(credentials.redact(str(error)))}[/yellow]")
+                continue
             if prompt.split(maxsplit=1)[0].lower() in {"/mcp", "/mcps"}:
                 previous_config = None
                 previous_status = snapshot_connection_statuses()
@@ -1629,34 +1796,6 @@ async def run_agent(
                             console.print(f"[yellow]MCP rollback failed: {escape(str(rollback_error))}[/yellow]")
                     restore_connection_statuses(previous_status)
                     console.print(f"[yellow]MCP command failed: {escape(credentials.redact(str(error)))}[/yellow]")
-                continue
-            if prompt.split(maxsplit=1)[0].lower() == "/key":
-                if len(prompt.split()) != 1:
-                    console.print("[yellow]Use /key with no argument; never type a key in the command.[/yellow]")
-                    continue
-                provider, _ = parse_model_selection(selected_model)
-                if provider == "ollama":
-                    console.print("[yellow]Select an openai:<model> or gemini:<model> first.[/yellow]")
-                    continue
-                console.print(f"[yellow]{escape(CLOUD_KEY_WARNING)}[/yellow]")
-                previous_key = credentials.get(provider)
-                if not _prompt_cli_key(credentials, provider):
-                    continue
-                try:
-                    with console.status("Updating cloud model credentials..."):
-                        replacement_agent, replacement_config = await setup_agent(
-                            model_name=selected_model, credentials=credentials
-                        )
-                    agent, thread_config = replacement_agent, replacement_config
-                    console.print("[green]Cloud key updated for this session.[/green]")
-                except Exception as error:
-                    detail = credentials.redact(str(error))
-                    if previous_key is not None:
-                        detail = detail.replace(previous_key.get_secret_value(), "[REDACTED API KEY]")
-                        credentials.set(provider, previous_key.get_secret_value())
-                    else:
-                        credentials.clear()
-                    console.print(f"[yellow]Key update failed: {escape(detail)}[/yellow]")
                 continue
             if prompt.split(maxsplit=1)[0].lower() in {"/model", "/models"}:
                 previous_provider, _ = parse_model_selection(selected_model)
@@ -1708,9 +1847,9 @@ async def run_agent(
                                 )
                         elif credentials.get(provider) is None:
                             console.print(f"[yellow]{escape(CLOUD_KEY_WARNING)}[/yellow]")
-                            if not use_environment_key(credentials, provider) and not _prompt_cli_key(credentials, provider):
+                            if not use_active_key(credentials, provider, project_root) and not _prompt_cli_key(credentials, provider):
                                 continue
-                        if requested == selected_model:
+                        if requested == selected_model and agent is not None:
                             console.print(f"[cyan]Already using {escape(requested)}.[/cyan]")
                         else:
                             with console.status(f"Switching to {escape(requested)}..."):
@@ -1738,13 +1877,22 @@ async def run_agent(
             if next_id != selected_id:
                 selected_id = next_id or selected_id
                 thread_manager.select_thread(selected_id)
+                reset_active_workspace(workspace_token)
+                workspace_token = set_active_workspace(thread_workspace(
+                    selected_id, project_root=project_root, development=DEV_MODE,
+                ))
                 conversation_store = thread_manager.store(selected_id)
                 conversation_history = conversation_store.load()
                 thread_config = new_thread_config()
                 console.print(
                     f"[cyan]Now using conversation thread: {selected_id} "
-                    f"(trust: {thread_manager.resolve(selected_id).trust_mode})[/cyan]"
+                    f"(trust: {thread_manager.resolve(selected_id).trust_mode}); "
+                    f"workspace: {escape(str(current_workspace_root()))}[/cyan]"
                 )
+            continue
+
+        if agent is None:
+            console.print("[yellow]Wallace has no active model credentials. Use /key on <name> or /model to continue.[/yellow]")
             continue
 
         plan = None
@@ -1757,7 +1905,7 @@ async def run_agent(
             console.print(f"[yellow]Could not save conversation turn: {escape(str(error))}[/yellow]")
             continue
         try:
-            plan = resume_or_create(project_root, prompt, session_id=selected_id)
+            plan = resume_or_create(project_root, prompt, session_id=plan_session_id(selected_id, development=DEV_MODE))
             console.print(
                 f"[cyan]Plan {plan.plan_id} ready; next step: "
                 f"{plan.next_pending().title if plan.next_pending() else 'complete'}[/cyan]"
@@ -1790,7 +1938,10 @@ async def run_agent(
             with console.status("Preparing thread context..."):
                 memory, memory_warning = await conversation_store.memory_context(
                     prompt,
-                    partial(summarize_thread_memory, model_name=selected_model, credentials=credentials),
+                    partial(
+                        summarize_thread_memory, model_name=selected_model,
+                        credentials=credentials, usage_tracker=session_usage,
+                    ),
                     max_chars=memory_budget_for(agent_prompt),
                 )
             if memory_warning:
@@ -1804,6 +1955,8 @@ async def run_agent(
                 agent, thread_config, agent_prompt,
                 model_name=selected_model, credentials=credentials,
                 trust_mode=thread_manager.resolve(selected_id).trust_mode,
+                approval_timeout_seconds=thread_manager.resolve(selected_id).approval_timeout_seconds,
+                usage_tracker=session_usage,
             )
         except Exception as error:
             if plan is not None:
@@ -1834,6 +1987,7 @@ async def run_agent(
             approved = _ask_cli_approval(
                 request, model_name=selected_model, credentials=credentials,
                 trust_mode=thread_manager.resolve(selected_id).trust_mode,
+                approval_timeout_seconds=thread_manager.resolve(selected_id).approval_timeout_seconds,
             )
             if approved:
                 console.print("[cyan]Running full project tests...[/cyan]")
@@ -1854,6 +2008,8 @@ async def run_agent(
                     agent, thread_config, EMPTY_RESPONSE_RETRY_PROMPT,
                     model_name=selected_model, credentials=credentials,
                     trust_mode=thread_manager.resolve(selected_id).trust_mode,
+                    approval_timeout_seconds=thread_manager.resolve(selected_id).approval_timeout_seconds,
+                    usage_tracker=session_usage,
                 )
                 response = assistant_response_text(retry_result.get("messages", []))
                 result = {
@@ -1910,6 +2066,8 @@ async def run_agent(
                     agent, thread_config, clean_response_retry_prompt(prompt),
                     model_name=selected_model, credentials=credentials,
                     trust_mode=thread_manager.resolve(selected_id).trust_mode,
+                    approval_timeout_seconds=thread_manager.resolve(selected_id).approval_timeout_seconds,
+                    usage_tracker=session_usage,
                 )
                 retry_response = assistant_response_text(retry_result.get("messages", []))
                 if retry_response is not None:
@@ -1953,6 +2111,9 @@ async def run_agent(
         print("\n--------- AI ----------")
         console.print(Markdown(response))
 
+    reset_status(status_token)
+    reset_active_workspace(workspace_token)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Wallace in the terminal.")
@@ -1964,9 +2125,20 @@ def main() -> None:
     parser.add_argument("--new-thread", action="store_true", help="Start a new conversation thread.")
     parser.add_argument("--thread-title", help="Title for a new conversation thread.")
     parser.add_argument("--trust-mode", choices=TRUST_MODES, default="no-trust", help="Trust mode for --new-thread (default: no-trust).")
+    parser.add_argument("--dev", action="store_true", help="Use Wallace source-development access (also available via dev_cli.py).")
     args = parser.parse_args()
+    if args.dev and not DEV_MODE:
+        # Console entry points import main before parsing; restart once so
+        # tools are imported under the correct access boundary.
+        os.execve(
+            sys.executable,
+            [sys.executable, str(APP_ROOT / "main.py"), *sys.argv[1:]],
+            {**os.environ, "WALLACE_DEV_MODE": "1"},
+        )
     if args.thread_id and args.session_id:
         parser.error("use --thread-id or the legacy --session-id, not both")
+    if not DEV_MODE and (args.thread_id == "wallace_dev" or args.session_id == "wallace_dev"):
+        parser.error("the permanent development thread is only available with --dev")
     if not args.new_thread and args.trust_mode != "no-trust":
         parser.error("--trust-mode requires --new-thread; use /trust for an existing thread")
     asyncio.run(

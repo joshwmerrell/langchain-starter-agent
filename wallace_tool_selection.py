@@ -36,6 +36,7 @@ SYSTEM_WORDS = re.compile(
 )
 DOC_WORDS = re.compile(r"\b(langchain|documentation|docs|mcp)\b", re.IGNORECASE)
 MCP_WORDS = re.compile(r"\b(mcp|servers?|connections?)\b", re.IGNORECASE)
+STATUS_WORDS = re.compile(r"\b(status|tokens?|usage|quota|limits?|remaining|session)\b", re.IGNORECASE)
 
 
 def current_request(prompt: str) -> str:
@@ -68,6 +69,8 @@ def select_tools(prompt: str, available: Sequence) -> list:
         selected |= names & EDIT
     if system_requested:
         selected.add("get_system_info")
+    if STATUS_WORDS.search(task):
+        selected.add("get_session_status")
     if MCP_WORDS.search(task):
         selected.add("list_mcp_connections")
     for tool in available:

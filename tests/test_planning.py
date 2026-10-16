@@ -20,6 +20,13 @@ from wallace_planning import (
 
 
 class PlanningTests(unittest.TestCase):
+    def test_diagnose_requests_require_inspection_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Diagnose why get_git_status returned nothing / errored.")
+        self.assertEqual(plan.intent, "review")
+        self.assertEqual(plan.steps[0].title, "Inspect relevant context")
+        self.assertEqual(plan.steps[-1].title, "Summarize and hand off")
+
     def test_detailed_user_correction_survives_terse_continue(self):
         correction = (
             "Continue the unfinished deletion of test_site. The directory is already "
