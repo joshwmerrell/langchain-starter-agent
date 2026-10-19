@@ -12,8 +12,16 @@ def response_quality_error(
     current_request: str = "",
 ) -> str | None:
     """Detect output loops and copied replies before displaying or saving them."""
+    if re.search(r"</?tool_call(?:\s|>)", response, re.I) and not re.search(
+        r"\b(?:example|demonstrate|quote|show|format|syntax|literal)\b",
+        current_request, re.I,
+    ):
+        return (
+            "The model wrote a tool-call tag as text instead of invoking a tool. "
+            "Wallace did not accept it as completion; the request remains unfinished."
+        )
     issue = (
-        "Ollama generated a repetitive response instead of a usable answer. "
+        "The model generated a repetitive response instead of a usable answer. "
         "Wallace did not accept it as completion; the request remains unfinished. "
         "If it recurs, try a smaller step or a different tool-calling model."
     )
@@ -29,7 +37,7 @@ def response_quality_error(
             threshold = max(150, min(200, int(min(len(previous), len(current)) * 0.6)))
             if SequenceMatcher(None, previous, current, autojunk=False).find_longest_match().size >= threshold:
                 return (
-                    "Ollama copied an earlier reply instead of answering the current request. "
+                    "The model copied an earlier reply instead of answering the current request. "
                     "Wallace did not accept it as completion; the request remains unfinished."
                 )
     if len(response) < 500:

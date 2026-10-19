@@ -6,6 +6,28 @@
       "url": "https://example.com/mcp",
       "enabled": false,
       "keywords": ["example"]
+    },
+    {
+      "name": "github-remote",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "auth_env": "GITHUB_MCP_TOKEN",
+      "enabled": false,
+      "keywords": ["github", "repository"]
+    },
+    {
+      "name": "github-local",
+      "transport": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      },
+      "enabled": false,
+      "keywords": ["github", "repository", "code", "pull", "request"]
     }
   ]
 }

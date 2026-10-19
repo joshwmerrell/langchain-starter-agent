@@ -21,6 +21,25 @@ MAX_PLAN_RESULT_CHARS = 4_000
 MAX_PLAN_SUMMARY_CHARS = 2_000
 MAX_TRACKED_TARGETS = 80
 MAX_UNRESOLVED_FAILURES = 20
+TEXT_ARTIFACT_SUFFIXES = {".txt", ".md", ".rst", ".log", ".csv", ".tsv"}
+
+
+def _tool_work(request: str) -> bool:
+    """Only requests to build or repair a tool need a contract gate."""
+    action = r"(?:build|add|create|implement|fix|repair|debug|troubleshoot|update)"
+    return bool(re.search(
+        rf"\b{action}\b.{{0,80}}\btools?\b|\btools?\b.{{0,80}}\b{action}\b",
+        request, re.IGNORECASE,
+    ))
+
+
+def _named_tool(request: str) -> str | None:
+    match = re.search(
+        r"\b(?:tool\s+(?:named|called)\s+|(?:fix|repair|debug|troubleshoot)\s+(?:the\s+)?)"
+        r"`?([a-z][a-z0-9]*_[a-z0-9_]+)`?",
+        request, re.IGNORECASE,
+    )
+    return match.group(1) if match else None
 
 
 def _validation_applies(item: dict[str, Any], target: str) -> bool:
@@ -29,29 +48,86 @@ def _validation_applies(item: dict[str, Any], target: str) -> bool:
     checked = Path(str(item.get("target", "")))
     edited = Path(target)
     suffix = edited.suffix.lower()
+    if name == "read_safe_file":
+        return suffix in TEXT_ARTIFACT_SUFFIXES and checked == edited
     if name == "check_source_file":
         return checked == edited
     if name == "check_python_syntax":
         return suffix == ".py" and checked == edited
     if name == "run_tests":
-        return suffix == ".py" or suffix not in {
-            ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".rs",
-            ".html", ".css", ".sh",
-        }
+        # A scoped test is not evidence about unrelated application modules.
+        # Additional coverage mappings must come from the host, never model prose.
+        covered = item.get("validation_targets", [])
+        return suffix == ".py" and (
+            str(checked) in {".", "tests"} or checked == edited
+            or target in covered
+        )
     if name == "run_language_tests":
         languages = {
+            ".py": "python",
             ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript",
             ".ts": "typescript", ".tsx": "typescript",
             ".go": "go", ".rs": "rust",
         }
         expected = languages.get(suffix)
         language = str(item.get("language", "")).lower()
+        if language == "python":
+            return expected == "python" and _validation_applies({**item, "name": "run_tests"}, target)
         return bool(expected and language == expected and (
             checked == Path(".") or edited.is_relative_to(checked)
         ))
     if name == "verify_tool_contract":
         return edited.name == "tools.py"
     return False
+
+
+def _unscoped_mutation(item: dict[str, Any]) -> bool:
+    """Conservatively identify work whose changed files the host did not record."""
+    if item.get("changed_paths"):
+        return False
+    if item.get("name") == "execute_command" and _deletion_target(item) is not None:
+        return False
+    if item.get("mutation") is not None:
+        return bool(item["mutation"]) and not item.get("changed_paths")
+    if item.get("name") != "execute_command":
+        return False
+    command = str(item.get("target", ""))
+    if re.search(r"(?:^|\s)(?:sed\s+-i|tee|touch|mkdir|cp|mv|rm|rmdir|unlink|install|patch)\b|(?<![<=>])>{1,2}(?![=])|\bgit\s+(?:apply|checkout|restore|reset|clean|merge|commit|add)\b", command):
+        return True
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return True
+    if any(character in command for character in ";|&") or any(flag in words for flag in ("-delete", "-exec", "-execdir")):
+        return True
+    if words and words[0] == "git":
+        return len(words) < 2 or words[1] not in {"status", "diff", "log", "show", "ls-files", "rev-parse"}
+    if not words:
+        return False
+    if words[0] in {"pytest", "ruff", "shellcheck"}:
+        return False
+    if words[0] in {"python", "python3"} and words[1:3] in (["-m", "unittest"], ["-m", "pytest"]):
+        return False
+    if words[:2] == ["deno", "check"] or (words[0] == "tsc" and "--noEmit" in words):
+        return False
+    # Arbitrary scripts and shell pipelines can write files. The host can mark
+    # a command read-only or supply changed_paths when it knows the actual scope.
+    return words[0] not in {
+        "pwd", "ls", "cat", "head", "tail", "rg", "grep", "find", "file",
+        "stat", "wc", "test", "which", "echo", "printf",
+    }
+
+
+def _activity_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    """Keep bounded host evidence through serialization and incremental updates."""
+    metadata: dict[str, Any] = {}
+    if isinstance(item.get("mutation"), bool):
+        metadata["mutation"] = item["mutation"]
+    for key in ("changed_paths", "validation_targets", "resolved_mutation_ids"):
+        values = item.get(key)
+        if isinstance(values, list):
+            metadata[key] = [bounded(value, 160) for value in values[:MAX_TRACKED_TARGETS] if isinstance(value, str)]
+    return metadata
 
 
 def _target_validated(target: str, validations: list[str]) -> bool:
@@ -61,7 +137,9 @@ def _target_validated(target: str, validations: list[str]) -> bool:
         # and runs an invocation test, so it subsumes a syntax-only check.
         return "verify_tool_contract" in checks
     suffix = Path(target).suffix.lower()
-    if suffix == ".py":
+    if suffix in TEXT_ARTIFACT_SUFFIXES:
+        valid = "read_safe_file" in checks
+    elif suffix == ".py":
         valid = bool(checks & {"check_source_file", "check_python_syntax", "run_tests"})
     elif suffix in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".html", ".css", ".sh"}:
         valid = "check_source_file" in checks
@@ -303,7 +381,9 @@ class PlanSpec:
                     "outcome": bounded(item.get("outcome", ""), 160),
                     "diagnostic": bounded(item.get("diagnostic", ""), 120),
                     "language": bounded(item.get("language", ""), 20),
+                    "test_path": bounded(item.get("test_path", ""), 160),
                     "ok": bool(item.get("ok", False)),
+                    **_activity_metadata(item),
                 }
                 for item in value.get("tool_history", [])[-12:]
                 if isinstance(item, dict)
@@ -325,6 +405,15 @@ class PlanSpec:
                 "targets": targets,
                 "target_overflow": bool(raw_evidence.get("target_overflow"))
                 or len(raw_targets) > MAX_TRACKED_TARGETS,
+                "contract": {
+                    "tool_name": bounded(raw_evidence.get("contract", {}).get("tool_name", ""), 80),
+                    "test_path": bounded(raw_evidence.get("contract", {}).get("test_path", ""), 160),
+                } if isinstance(raw_evidence.get("contract"), dict) else {},
+                "unscoped_mutations": [
+                    {key: bounded(item.get(key, ""), 160) for key in ("id", "name", "target")}
+                    for item in raw_evidence.get("unscoped_mutations", [])[:MAX_TRACKED_TARGETS]
+                    if isinstance(item, dict)
+                ] if isinstance(raw_evidence.get("unscoped_mutations", []), list) else [],
             } if raw_evidence else {},
             unresolved_failures=[
                 {
@@ -366,16 +455,20 @@ class PlanSpec:
     def incomplete_handoff(self) -> str | None:
         """Give the host a factual handoff instead of an unverified success claim."""
         targets = self.edit_evidence.get("targets", {})
-        if self.status == "complete" or (
+        unscoped = self.edit_evidence.get("unscoped_mutations", [])
+        if (self.status == "complete" and not unscoped) or (
             self.intent not in {"implement", "fix", "refactor", "delete"}
             and not (self.intent == "test" and len(self.steps) >= 3)
             and not targets and not self.unresolved_failures
             and not self.failure_overflow
             and not self.edit_evidence.get("target_overflow")
+            and not unscoped
         ):
             return None
         unchecked = self.unchecked_targets()
         details = []
+        if unscoped:
+            details.append("A command or external tool may have changed files without a recorded change scope; inspect its effects before claiming verification.")
         if self.unresolved_failures:
             failed = self.unresolved_failures[-1]
             detail = failed.get("diagnostic") or failed.get("outcome") or "failed"
@@ -384,6 +477,8 @@ class PlanSpec:
             details.append("Too many unresolved checks or edited files to verify in this plan.")
         if unchecked:
             details.append("Files needing matching validation: " + ", ".join(unchecked[:5]) + ".")
+        if targets and _tool_work(self.request) and not self._contract_verified():
+            details.append("A matching tool contract test has not passed after the latest edit.")
         if self.intent == "test" and len(self.steps) >= 3 and self.steps[-2].status != "complete":
             details.append("Required code checks or tests have not passed.")
         if self.intent == "delete" and len(self.steps) >= 4:
@@ -408,6 +503,67 @@ class PlanSpec:
             if not _target_validated(target, record.get("validations", []))
         ]
 
+    def verification_note(self) -> str | None:
+        """Distinguish passing source checks from observed behavioral tests."""
+        if self.intent == "delete":
+            return None
+        targets = self.edit_evidence.get("targets", {})
+        if not targets:
+            return None
+        unchecked = self.unchecked_targets()
+        if unchecked:
+            return "Matching post-edit checks are still missing for " + ", ".join(unchecked[:5]) + "."
+        source_only = [
+            target for target, record in targets.items()
+            if not set(record.get("validations", [])) & {
+                "run_tests", "run_language_tests", "verify_tool_contract",
+            }
+        ]
+        if source_only and all(Path(target).suffix.lower() in TEXT_ARTIFACT_SUFFIXES for target in source_only):
+            return "Saved text read back: " + ", ".join(source_only[:5]) + "."
+        if source_only:
+            return (
+                "Source/syntax checks only for " + ", ".join(source_only[:5])
+                + "; functional behavior was not tested for these files."
+            )
+        return "Passing tests were observed within their recorded scope; they do not prove every requested behavior."
+
+    def _contract_verified(self) -> bool:
+        contract = self.edit_evidence.get("contract", {})
+        if not isinstance(contract, dict) or not contract.get("tool_name"):
+            return False
+        requested = _named_tool(self.request)
+        return requested is None or requested == contract["tool_name"]
+
+    def execution_assessment(self) -> str:
+        """State what the host actually observed, without inventing a root cause."""
+        failed = self.unresolved_failures[-1] if self.unresolved_failures else None
+        if failed is None:
+            resolved: set[tuple[str, str]] = set()
+            for item in reversed(self.tool_history):
+                key = (str(item.get("name", "")), str(item.get("target", "")))
+                if item.get("ok"):
+                    resolved.add(key)
+                elif key not in resolved:
+                    failed = item
+                    break
+        if failed is not None:
+            name = failed["name"]
+            if name in {"run_tests", "run_language_tests", "verify_tool_contract"}:
+                return (
+                    f"Verification failed in {name}. Inspect the full result, reproduce the "
+                    "specific case, then decide whether the tool, test, or setup is faulty."
+                )
+            return (
+                f"Invocation of {name} failed. Check arguments, workspace scope, "
+                "approvals, and dependencies before calling the tool implementation faulty."
+            )
+        if self.edit_evidence.get("targets") and _tool_work(self.request) and not self._contract_verified():
+            return "Agent execution gap: edited tool code without a passing matching contract check."
+        if self.intent in {"implement", "fix", "refactor"} and not self.edit_evidence.get("targets"):
+            return "No successful file edit has been observed yet."
+        return "No failure cause is established by the recorded tool results."
+
     def record_progress(
         self,
         activity: list[dict[str, Any]],
@@ -422,6 +578,7 @@ class PlanSpec:
             "run_language_tests", "verify_tool_contract", "host_path_absence_check",
         }
         evidence = dict(self.edit_evidence)
+        unscoped = list(evidence.get("unscoped_mutations", []))
         targets = {
             path: {"id": record.get("id", ""), "validations": list(record.get("validations", []))}
             for path, record in evidence.get("targets", {}).items()
@@ -435,11 +592,23 @@ class PlanSpec:
         ]
 
         def observe_evidence(item: dict[str, Any], index: int) -> None:
-            nonlocal evidence
-            if not item["ok"]:
+            nonlocal evidence, unscoped
+            # A failing command can still have written files before it failed.
+            if not item["ok"] and not item.get("changed_paths") and not item.get("mutation"):
                 return
-            if item["name"] in edits:
-                target = str(item["target"])
+            resolved = set(item.get("resolved_mutation_ids", [])) if item["ok"] else set()
+            unscoped = [event for event in unscoped if event.get("id") not in resolved]
+            if _unscoped_mutation(item):
+                event = {key: str(item.get(key, "")) for key in ("id", "name", "target")}
+                if event not in unscoped:
+                    unscoped.append(event)
+                if len(unscoped) > MAX_TRACKED_TARGETS:
+                    evidence["target_overflow"] = True
+                unscoped = unscoped[-MAX_TRACKED_TARGETS:]
+            changed = list(item.get("changed_paths", []))
+            if item["ok"] and item["name"] in edits:
+                changed.append(str(item["target"]))
+            for target in dict.fromkeys(changed):
                 targets[target] = {
                     "id": str(item["id"] or f"{index}:{item['name']}:{target}"),
                     "validations": [],
@@ -454,8 +623,14 @@ class PlanSpec:
                     or Path(target).name == "tools.py",
                     "validations": [],
                     "target_overflow": bool(evidence.get("target_overflow")),
+                    "contract": {},
                 }
-            elif item["name"] in validation:
+            if item["ok"] and (item["name"] in validation or item["name"] == "read_safe_file"):
+                if item["name"] == "verify_tool_contract":
+                    evidence["contract"] = {
+                        "tool_name": str(item["target"]),
+                        "test_path": str(item.get("test_path", "")),
+                    }
                 for target, record in targets.items():
                     if _validation_applies(item, target):
                         checked = record["validations"]
@@ -478,6 +653,10 @@ class PlanSpec:
                         failed for failed in failures
                         if not (
                             failed["name"] in validation
+                            and (
+                                failed["name"] == name
+                                or (name == "check_source_file" and failed["name"] == "check_python_syntax")
+                            )
                             and (
                                 failed["target"] == target
                                 or (
@@ -537,7 +716,9 @@ class PlanSpec:
                 "outcome": bounded(item.get("outcome", ""), 160),
                 "diagnostic": bounded(item.get("diagnostic", ""), 120),
                 "language": bounded(item.get("language", ""), 20),
+                "test_path": bounded(item.get("test_path", ""), 160),
                 "ok": bool(item.get("ok", False)),
+                **_activity_metadata(item),
             }
             observed_history.append(entry)
             observe_evidence(entry, len(observed_history) - 1)
@@ -548,6 +729,10 @@ class PlanSpec:
             evidence["targets"] = targets
             if evidence.get("target") in targets:
                 evidence["validations"] = list(targets[evidence["target"]]["validations"])
+        if unscoped:
+            evidence["unscoped_mutations"] = unscoped
+        else:
+            evidence.pop("unscoped_mutations", None)
         self.edit_evidence = evidence
         self.unresolved_failures = failures
 
@@ -598,7 +783,7 @@ class PlanSpec:
             )
             verified = (
                 self.steps[1].status == "complete" and absence_checked and git_checked
-                and suite_checked and not failures and not self.failure_overflow
+                and suite_checked and not failures and not self.failure_overflow and not unscoped
             )
             if verified:
                 finish(self.steps[2], "Target absence, Git status, and full project tests verified.")
@@ -621,7 +806,7 @@ class PlanSpec:
             validated_after_edit = bool(targets) and all(
                 _target_validated(target, record["validations"])
                 for target, record in targets.items()
-            ) and not failures and not self.failure_overflow and not evidence.get("target_overflow")
+            ) and (not _tool_work(self.request) or self._contract_verified()) and not failures and not self.failure_overflow and not evidence.get("target_overflow") and not unscoped
             feature_steps = self.steps[1:-2]
             validation_step = self.steps[-2]
             if not validated_after_edit and validation_step.status == "complete":
@@ -632,19 +817,24 @@ class PlanSpec:
                 self.steps[-1].status = "pending"
                 self.steps[-1].result = "Completion was not verified."
                 self.steps[-1].updated_at = utc_now()
-            if response and not error and validated_after_edit and feature_steps:
-                edit_id = str(evidence["id"])
-                consumed = {
-                    str(step.tool_args.get("_evidence_edit_id"))
-                    for step in feature_steps if step.status == "complete"
-                }
-                if edit_id not in consumed:
-                    pending_feature = next((step for step in feature_steps if step.status != "complete"), None)
-                    if pending_feature is not None:
-                        finish(pending_feature, "Edited and validated: " + str(evidence["target"]))
-                        pending_feature.tool_args["_evidence_edit_id"] = edit_id
+            # These stages describe observed actions, not proof of individual
+            # requested features. Preserve legacy plans without inventing a
+            # mapping from an arbitrary edit ID to one feature's correctness.
+            if len(feature_steps) > 1:
+                work_step = PlanStep(
+                    "step-02", "Apply requested changes",
+                    "Record changed files; the original request remains the scope.",
+                    sources=self.sources,
+                )
+                self.steps = [self.steps[0], work_step, *self.steps[-2:]]
+                for number, step in enumerate(self.steps, 1):
+                    step.id = f"step-{number:02d}"
+                feature_steps = [work_step]
+                validation_step = self.steps[-2]
+            if targets and feature_steps:
+                finish(feature_steps[0], "Successful file edits recorded: " + ", ".join(targets)[:500])
             if validated_after_edit and all(step.status == "complete" for step in feature_steps):
-                finish(validation_step, "Validation tool completed: " + ", ".join(sorted(validation_names)))
+                finish(validation_step, "Passing checks observed: " + ", ".join(sorted(validation_names)) + ". Check scope does not establish every requested behavior.")
             if response and not error and validated_after_edit and all(step.status == "complete" for step in self.steps[:-1]):
                 finish(self.steps[-1], "Final response provided.\n" + bounded(response, 1_000))
         elif self.intent == "test" and len(self.steps) >= 3:
@@ -652,7 +842,7 @@ class PlanSpec:
                 finish(self.steps[0], "Project context inspected with tools.")
             checks_passed = (
                 self.steps[-2].status == "complete" or bool(observed & validation)
-            ) and not failures and not self.failure_overflow and not evidence.get("target_overflow") and all(
+            ) and not failures and not self.failure_overflow and not evidence.get("target_overflow") and not unscoped and all(
                 _target_validated(target, record["validations"])
                 for target, record in targets.items()
             )
@@ -669,7 +859,7 @@ class PlanSpec:
         elif self.intent in {"review", "research", "test"} and len(self.steps) >= 2:
             if observed & inspection or observed & validation:
                 finish(self.steps[0], "Project context inspected with tools.")
-            edits_validated = not failures and not self.failure_overflow and not evidence.get("target_overflow") and all(
+            edits_validated = not failures and not self.failure_overflow and not evidence.get("target_overflow") and not unscoped and all(
                 _target_validated(target, record["validations"])
                 for target, record in targets.items()
             )
@@ -685,8 +875,8 @@ class PlanSpec:
             validated_after_edit = bool(targets) and all(
                 _target_validated(target, record["validations"])
                 for target, record in targets.items()
-            ) and not failures and not self.failure_overflow and not evidence.get("target_overflow")
-            if (targets and not validated_after_edit) or failures or self.failure_overflow or evidence.get("target_overflow"):
+            ) and not failures and not self.failure_overflow and not evidence.get("target_overflow") and not unscoped
+            if (targets and not validated_after_edit) or failures or self.failure_overflow or evidence.get("target_overflow") or unscoped:
                 self.steps[-1].status = "pending"
                 self.steps[-1].result = "Resolve failed tools and validate edited files."
                 self.steps[-1].updated_at = utc_now()

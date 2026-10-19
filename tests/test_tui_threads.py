@@ -10,9 +10,10 @@ from rich.markdown import Markdown
 from rich.text import Text
 from textual.selection import Selection
 from textual.theme import Theme
-from textual.widgets import Button, Header
+from textual.widgets import Button, Header, Input
 
 from tui_agent import AgentTUI, ApprovalScreen
+from tools import current_workspace_root
 from wallace_planning.threads import ConversationThreadManager
 from wallace_mcp import all_mcp_servers
 from wallace_themes import (
@@ -29,6 +30,39 @@ from wallace_themes import (
 
 
 class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_command_uses_selected_workspace_without_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("tui_agent.APP_ROOT", root), patch("tui_agent.SAFE_ROOT", root / "workspace"):
+                with patch.object(AgentTUI, "initialize_agent", lambda self: None):
+                    app = AgentTUI()
+                    async with app.run_test():
+                        with patch.object(app, "_handle_thread_command") as handle:
+                            app.on_input_submitted(Input.Submitted(app.prompt_input, "/run pwd"))
+                            handle.assert_called_once_with("/run pwd")
+                        with patch.object(app, "run_direct_command") as run:
+                            app._handle_thread_command('/run printf "%s" "a b"')
+                            run.assert_called_once_with('printf "%s" "a b"')
+                        called = []
+                        async def invoke(command, *, user_directed=False):
+                            called.append((command, current_workspace_root(), user_directed))
+                            return "Exit code: 0\nSTDOUT:\na b"
+                        with patch.object(app, "_ask_approval", new=AsyncMock(side_effect=AssertionError("unexpected approval"))) as approve:
+                            with patch("tui_agent.execute_command_async", invoke):
+                                await app.run_direct_command('printf "%s" "a b"').wait()
+                        self.assertEqual(called, [
+                            ('printf "%s" "a b"', app.workspace_root, True)
+                        ])
+                        approve.assert_not_awaited()
+                        self.assertFalse(app._busy)
+                        called.clear()
+                        with patch.object(app, "_ask_approval", new=AsyncMock(side_effect=AssertionError("unexpected approval"))):
+                            with patch("tui_agent.execute_command_async", invoke):
+                                for mode in ("no-trust", "informed-trust", "yes-trust"):
+                                    app.thread_manager.set_trust_mode(app.thread_id, mode)
+                                    await app.run_direct_command("pwd").wait()
+                        self.assertEqual(called, [("pwd", app.workspace_root, True)] * 3)
+
     async def test_running_tui_observes_other_window_thread_and_transcript_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -84,11 +118,15 @@ class TUIThreadTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(app.thread_id, thread_id)
                             self.assertEqual(app.conversation_store.load_all()[0]["content"], "Keep this conversation")
                             self.assertEqual(setup.await_count, 1)
+                            await app.change_mcp("auth", "files", "TEST_MCP_TOKEN").wait()
+                            self.assertEqual(setup.await_count, 2)
+                            await app.change_mcp("connect", "files").wait()
+                            self.assertEqual(setup.await_count, 3)
                             await app.change_mcp("off", "files").wait()
                             self.assertFalse(all_mcp_servers(root)[1].enabled)
                             await app.change_mcp("off", "langchain-docs").wait()
                             self.assertFalse(all_mcp_servers(root)[0].enabled)
-                            self.assertEqual(setup.await_count, 3)
+                            self.assertEqual(setup.await_count, 5)
                         with patch.object(app, "change_mcp") as change:
                             app._handle_thread_command("/mcp toggle files")
                             change.assert_called_once_with("on", "files", "", ())

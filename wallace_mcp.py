@@ -23,7 +23,10 @@ BUILTIN_URL = "https://docs.langchain.com/mcp"
 MAX_CONFIG_BYTES = 16_384
 MAX_SERVERS = 8
 _NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]{0,39}\Z")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_ENV_REFERENCE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$")
 _connection_status: dict[str, str] = {}
+_connection_details: dict[str, dict[str, object]] = {}
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,12 @@ class MCPServer:
     keywords: tuple[str, ...]
     enabled: bool = True
     builtin: bool = False
+    transport: str = "http"
+    command: str = ""
+    args: tuple[str, ...] = ()
+    env: tuple[tuple[str, str], ...] = ()
+    cwd: str | None = None
+    auth_env: str | None = None
 
 
 def _configuration_path(root: Path) -> Path:
@@ -64,6 +73,33 @@ def _validate_url(name: str, url: object) -> None:
         raise ValueError(f"MCP server {name} needs HTTPS or loopback HTTP without credentials in the URL")
 
 
+def _validate_stdio(name: str, entry: dict) -> None:
+    command = entry.get("command")
+    args = entry.get("args", [])
+    env = entry.get("env", {})
+    cwd = entry.get("cwd")
+    if not isinstance(command, str) or not command or any(char.isspace() or ord(char) < 32 for char in command):
+        raise ValueError(f"MCP stdio server {name} needs a command without whitespace")
+    if not isinstance(args, list) or len(args) > 64 or any(
+        not isinstance(arg, str) or not arg or any(ord(char) < 32 for char in arg)
+        for arg in args
+    ):
+        raise ValueError(f"MCP stdio server {name} has invalid args")
+    if not isinstance(env, dict) or len(env) > 32:
+        raise ValueError(f"MCP stdio server {name} has invalid env")
+    for key, value in env.items():
+        if not isinstance(key, str) or not _ENV_NAME.fullmatch(key) or not isinstance(value, str):
+            raise ValueError(f"MCP stdio server {name} has invalid env references")
+        if _ENV_REFERENCE.fullmatch(value) is None:
+            raise ValueError(
+                f"MCP stdio server {name} env values must reference host variables like ${{TOKEN}}"
+            )
+    if cwd is not None and (
+        not isinstance(cwd, str) or not cwd or Path(cwd).is_absolute() or ".." in Path(cwd).parts
+    ):
+        raise ValueError(f"MCP stdio server {name} cwd must be a relative path inside the project")
+
+
 def _validate_config(value: object) -> dict:
     if not isinstance(value, dict) or not isinstance(value.get("servers"), list):
         raise ValueError("MCP configuration needs a servers list")
@@ -82,7 +118,20 @@ def _validate_config(value: object) -> dict:
             raise ValueError("MCP server name must be short and alphanumeric")
         if name.casefold() in seen:
             raise ValueError(f"duplicate or reserved MCP server name: {name}")
-        _validate_url(name, entry.get("url"))
+        transport = entry.get("transport", "http")
+        if transport == "http":
+            _validate_url(name, entry.get("url"))
+            auth_env = entry.get("auth_env")
+            if auth_env is not None and (
+                not isinstance(auth_env, str) or not _ENV_NAME.fullmatch(auth_env)
+            ):
+                raise ValueError(f"MCP server {name} auth_env must name a host environment variable")
+        elif transport == "stdio":
+            _validate_stdio(name, entry)
+            if "auth_env" in entry:
+                raise ValueError(f"MCP stdio server {name} uses env mappings, not auth_env")
+        else:
+            raise ValueError(f"MCP server {name} transport must be http or stdio")
         keywords = entry.get("keywords", [])
         if not isinstance(keywords, list) or len(keywords) > 12 or any(
             not isinstance(word, str) or not _NAME.fullmatch(word)
@@ -163,9 +212,14 @@ def all_mcp_servers(root: Path) -> list[MCPServer]:
     )]
     servers.extend(
         MCPServer(
-            entry["name"], entry["url"],
+            entry["name"], entry.get("url", ""),
             tuple(word.casefold() for word in entry.get("keywords", [])),
             entry.get("enabled", False), False,
+            entry.get("transport", "http"), entry.get("command", ""),
+            tuple(entry.get("args", [])),
+            tuple((key, value) for key, value in entry.get("env", {}).items()),
+            entry.get("cwd"),
+            entry.get("auth_env"),
         )
         for entry in value["servers"]
     )
@@ -177,14 +231,77 @@ def load_mcp_servers(root: Path) -> list[MCPServer]:
     return [server for server in all_mcp_servers(root) if server.enabled and not server.builtin]
 
 
+def mcp_target(server: MCPServer, root: Path):
+    """Return the LangChain MCPAdapter target for a validated server."""
+    if server.transport == "http":
+        if not server.auth_env:
+            return server.url
+        token = os.environ.get(server.auth_env, "")
+        if not token:
+            raise ValueError(
+                f"MCP server {server.name} requires host environment variable {server.auth_env}"
+            )
+        if any(ord(character) < 32 or ord(character) == 127 for character in token):
+            raise ValueError(f"MCP server {server.name} host token contains an invalid control character")
+        return {"mcpServers": {server.name: {
+            "url": server.url,
+            "transport": "http",
+            "headers": {"Authorization": f"Bearer {token}"},
+        }}}
+    # Do not hand every Wallace credential and desktop variable to a child
+    # process. Keep a small runtime baseline and add only explicitly referenced
+    # variables from the user's configuration.
+    environment = {
+        key: os.environ[key]
+        for key in ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR")
+        if key in os.environ
+    }
+    for key, reference in server.env:
+        match = _ENV_REFERENCE.fullmatch(reference)
+        variable = match.group(1) or match.group(2) if match else ""
+        if variable not in os.environ:
+            raise ValueError(f"MCP server {server.name} requires host environment variable {variable}")
+        environment[key] = os.environ[variable]
+    config = {
+        "mcpServers": {
+            server.name: {
+                "command": server.command,
+                "args": list(server.args),
+                "env": environment,
+            }
+        }
+    }
+    if server.cwd:
+        working_directory = (root / server.cwd).resolve()
+        if not working_directory.is_relative_to(root.resolve()):
+            raise ValueError(f"MCP server {server.name} cwd must stay inside the project")
+        config["mcpServers"][server.name]["cwd"] = str(working_directory)
+    return config
+
+
+def describe_mcp_server(server: MCPServer) -> str:
+    """Return a safe, non-secret endpoint description for status screens."""
+    if server.transport == "stdio":
+        return "stdio: " + " ".join((server.command, *server.args))
+    return server.url
+
+
 def add_mcp_server(
-    root: Path, name: str, url: str, keywords: tuple[str, ...] = (),
-    *, live_applied: bool = False,
+    root: Path, name: str, url: str = "", keywords: tuple[str, ...] = (),
+    *, transport: str = "http", command: str = "", args: tuple[str, ...] = (),
+    env: tuple[tuple[str, str], ...] = (), cwd: str | None = None,
+    live_applied: bool = False,
 ) -> None:
     value = read_mcp_configuration(root)
-    value["servers"].append({
+    entry = {
         "name": name, "url": url, "enabled": True, "keywords": list(keywords),
-    })
+        "transport": transport,
+    }
+    if transport == "stdio":
+        entry.update({"command": command, "args": list(args), "env": dict(env)})
+        if cwd is not None:
+            entry["cwd"] = cwd
+    value["servers"].append(entry)
     save_mcp_configuration(root, value, live_applied=live_applied)
 
 
@@ -198,6 +315,7 @@ def remove_mcp_server(root: Path, name: str, *, live_applied: bool = False) -> N
     value["servers"] = remaining
     save_mcp_configuration(root, value, live_applied=live_applied)
     _connection_status.pop(name.casefold(), None)
+    _connection_details.pop(name.casefold(), None)
 
 
 def set_mcp_server_active(
@@ -219,6 +337,29 @@ def set_mcp_server_active(
     save_mcp_configuration(root, value, live_applied=live_applied)
     if not active:
         _connection_status.pop(name.casefold(), None)
+        _connection_details.pop(name.casefold(), None)
+    return True
+
+
+def set_mcp_server_auth_env(
+    root: Path, name: str, env_name: str, *, live_applied: bool = False,
+) -> bool:
+    """Save only a host-variable name, never an HTTP MCP credential."""
+    if not _ENV_NAME.fullmatch(env_name):
+        raise ValueError("auth_env must name a host environment variable")
+    value = read_mcp_configuration(root)
+    entry = next(
+        (item for item in value["servers"] if item["name"].casefold() == name.casefold()),
+        None,
+    )
+    if entry is None:
+        raise ValueError(f"unknown MCP server: {name}")
+    if entry.get("transport", "http") != "http":
+        raise ValueError(f"MCP server {name} is not an HTTP server")
+    if entry.get("auth_env") == env_name:
+        return False
+    entry["auth_env"] = env_name
+    save_mcp_configuration(root, value, live_applied=live_applied)
     return True
 
 
@@ -228,6 +369,10 @@ def parse_mcp_command(args: list[str], root: Path) -> tuple[str, str, str, tuple
         return "list", "", "", ()
     operation = args[0].lower()
     if operation == "add" and len(args) >= 3:
+        if args[2].lower() == "--stdio":
+            if len(args) < 4:
+                raise ValueError("use /mcp add <name> --stdio <command> [args...]")
+            return "add_stdio", args[1], args[3], tuple(args[4:])
         keywords = tuple(word for token in args[3:] for word in token.split(",") if word)
         return operation, args[1], args[2], keywords
     if operation in {"remove", "on", "off", "toggle"} and len(args) == 2:
@@ -240,11 +385,16 @@ def parse_mcp_command(args: list[str], root: Path) -> tuple[str, str, str, tuple
                 raise ValueError(f"unknown MCP server: {args[1]}")
             operation = "off" if server.enabled else "on"
         return operation, args[1], "", ()
+    if operation == "connect" and len(args) == 2:
+        return operation, args[1], "", ()
+    if operation == "auth" and len(args) == 3:
+        return operation, args[1], args[2], ()
     if operation == "reload" and len(args) == 1:
         return operation, "", "", ()
     raise ValueError(
         "use /mcp [list], /mcp add <name> <URL> [keywords...], "
-        "/mcp on|off|toggle|remove <name>, or /mcp reload"
+        "/mcp add <name> --stdio <command> [args...], "
+        "/mcp on|off|toggle|remove|connect <name>, /mcp auth <name> <ENV_NAME>, or /mcp reload"
     )
 
 
@@ -256,11 +406,29 @@ def apply_mcp_command(
     if operation == "add":
         add_mcp_server(root, name, url, keywords, live_applied=live_applied)
         return True
+    if operation == "add_stdio":
+        add_mcp_server(
+            root, name, keywords=(), transport="stdio", command=url,
+            args=keywords, live_applied=live_applied,
+        )
+        return True
     if operation == "remove":
         remove_mcp_server(root, name, live_applied=live_applied)
         return True
     if operation in {"on", "off"}:
         return set_mcp_server_active(root, name, operation == "on", live_applied=live_applied)
+    if operation == "auth":
+        return set_mcp_server_auth_env(root, name, url, live_applied=live_applied)
+    if operation == "connect":
+        server = next(
+            (item for item in all_mcp_servers(root) if item.name.casefold() == name.casefold()),
+            None,
+        )
+        if server is None:
+            raise ValueError(f"unknown MCP server: {name}")
+        if not server.enabled:
+            raise ValueError(f"MCP server {name} is inactive; use /mcp on {name} first")
+        return False
     if operation == "reload":
         return False
     raise ValueError(f"unknown MCP command: {operation}")
@@ -268,6 +436,7 @@ def apply_mcp_command(
 
 def clear_connection_statuses() -> None:
     _connection_status.clear()
+    _connection_details.clear()
 
 
 def snapshot_connection_statuses() -> dict[str, str]:
@@ -277,10 +446,42 @@ def snapshot_connection_statuses() -> dict[str, str]:
 def restore_connection_statuses(statuses: dict[str, str]) -> None:
     _connection_status.clear()
     _connection_status.update(statuses)
+    _connection_details.clear()
 
 
-def set_connection_status(name: str, connected: bool) -> None:
-    _connection_status[name.casefold()] = "connected" if connected else "not connected"
+def set_connection_status(
+    name: str, connected: bool, *, detail: str = "", tools: tuple[str, ...] = (),
+) -> None:
+    key = name.casefold()
+    _connection_status[key] = "connected" if connected else "not connected"
+    _connection_details[key] = {"detail": detail, "tools": tools if connected else ()}
+
+
+def connection_details(server: MCPServer) -> dict[str, object]:
+    """Return non-secret, process-local discovery diagnostics."""
+    if not server.enabled:
+        return {"detail": "", "tools": ()}
+    return dict(_connection_details.get(server.name.casefold(), {"detail": "Not yet checked in this process", "tools": ()}))
+
+
+def mcp_failure_summary(error: Exception) -> str:
+    """Classify a discovery error without forwarding tokens or raw headers to the model."""
+    message = str(error).lower()
+    if isinstance(error, TimeoutError) or "timed out" in message or "timeout" in message:
+        return "Connection or tool discovery timed out"
+    if "name resolution" in message or "dns" in message or "getaddrinfo" in message:
+        return "DNS lookup failed"
+    if "401" in message or "unauthorized" in message:
+        return "Authentication rejected (HTTP 401)"
+    if "403" in message or "forbidden" in message:
+        return "Access denied (HTTP 403)"
+    if "connection refused" in message:
+        return "Connection refused"
+    if "server returned an error response" in message:
+        return "Remote server rejected MCP discovery; check the endpoint and authentication"
+    if isinstance(error, ValueError) and "requires host environment variable" in message:
+        return "Required host environment variable is missing"
+    return f"Discovery failed ({type(error).__name__}); see Wallace's local startup warning"
 
 
 def connection_status(server: MCPServer) -> str:

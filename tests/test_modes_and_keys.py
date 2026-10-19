@@ -14,14 +14,19 @@ from unittest.mock import AsyncMock, patch
 from textual.widgets import Input
 
 from tools import (
-    _run_command, current_workspace_root, execute_command, get_git_diff,
+    _run_command, current_workspace_root, execute_command, execute_command_async,
+    execute_direct_command, get_git_diff,
     get_git_status, get_project_tree, read_safe_file,
     read_safe_file, replace_in_file, reset_active_workspace, run_tests,
     set_active_workspace, verify_tool_contract, write_safe_file,
 )
-from main import run_agent, setup_agent
+from main import direct_command_text, run_agent, setup_agent
 from tui_agent import AgentTUI, CloudKeyScreen
 from wallace_keys import active_key, add_key, list_keys, remove_key, set_key_active
+from wallace_mcp import (
+    MCPServer, add_mcp_server, all_mcp_servers, apply_mcp_command, mcp_target,
+    parse_mcp_command, read_mcp_configuration, save_mcp_configuration,
+)
 from wallace_planning.threads import ConversationThreadManager, DEV_THREAD_ID
 from wallace_runtime import plan_session_id, thread_workspace
 
@@ -41,6 +46,90 @@ class FakeKeyring:
 
 
 class ModeAndKeyTests(unittest.TestCase):
+    def test_direct_command_parser_preserves_shell_quoting(self):
+        self.assertEqual(direct_command_text('/run printf "%s" "a b"'), 'printf "%s" "a b"')
+        self.assertEqual(direct_command_text('/RUN git status'), 'git status')
+        self.assertIsNone(direct_command_text('/runner git status'))
+        with self.assertRaisesRegex(ValueError, "use /run"):
+            direct_command_text('/run')
+
+    def test_stdio_mcp_configuration_uses_host_env_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_mcp_configuration(root, {
+                "langchain_docs_enabled": True,
+                "servers": [{
+                    "name": "github-local",
+                    "transport": "stdio",
+                    "command": "docker",
+                    "args": ["run", "-i", "--rm"],
+                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},
+                    "enabled": True,
+                    "keywords": ["github"],
+                }],
+            })
+            with patch.dict(os.environ, {"GITHUB_TOKEN": "test-token"}, clear=False):
+                server = read_mcp_configuration(root)["servers"][0]
+                target = mcp_target(
+                    MCPServer(
+                        server["name"], "", tuple(server["keywords"]), True, False,
+                        "stdio", server["command"], tuple(server["args"]),
+                        tuple(server["env"].items()), None,
+                    ),
+                    root,
+                )
+            self.assertEqual(target["mcpServers"]["github-local"]["command"], "docker")
+            self.assertEqual(
+                target["mcpServers"]["github-local"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"],
+                "test-token",
+            )
+            self.assertEqual(
+                parse_mcp_command(["add", "github", "--stdio", "docker", "run", "-i"], root),
+                ("add_stdio", "github", "docker", ("run", "-i")),
+            )
+
+    def test_stdio_mcp_configuration_rejects_literal_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                save_mcp_configuration(Path(directory), {
+                    "servers": [{
+                        "name": "unsafe",
+                        "transport": "stdio",
+                        "command": "server",
+                        "env": {"TOKEN": "literal-secret"},
+                    }],
+                })
+
+    def test_http_mcp_auth_uses_only_a_host_environment_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            add_mcp_server(root, "github", "https://api.githubcopilot.com/mcp/")
+            self.assertEqual(
+                parse_mcp_command(["auth", "github", "GITHUB_MCP_TOKEN"], root),
+                ("auth", "github", "GITHUB_MCP_TOKEN", ()),
+            )
+            self.assertTrue(apply_mcp_command(root, "auth", "github", "GITHUB_MCP_TOKEN"))
+            self.assertFalse(apply_mcp_command(root, "auth", "github", "GITHUB_MCP_TOKEN"))
+            self.assertEqual(read_mcp_configuration(root)["servers"][0]["auth_env"], "GITHUB_MCP_TOKEN")
+            server = all_mcp_servers(root)[1]
+            with patch.dict(os.environ, {"GITHUB_MCP_TOKEN": "test-secret"}):
+                target = mcp_target(server, root)
+            self.assertEqual(
+                target["mcpServers"]["github"]["headers"]["Authorization"],
+                "Bearer test-secret",
+            )
+            from fastmcp.mcp_config import MCPConfig, RemoteMCPServer
+            self.assertIsInstance(MCPConfig.model_validate(target).mcpServers["github"], RemoteMCPServer)
+            self.assertNotIn("test-secret", (root / ".wallace" / "mcp_servers.json").read_text())
+            with patch.dict(os.environ, {"GITHUB_MCP_TOKEN": ""}):
+                with self.assertRaisesRegex(ValueError, "requires host environment variable"):
+                    mcp_target(server, root)
+            with patch.dict(os.environ, {"GITHUB_MCP_TOKEN": "bad\nheader"}):
+                with self.assertRaisesRegex(ValueError, "invalid control character"):
+                    mcp_target(server, root)
+            with self.assertRaisesRegex(ValueError, "auth_env must name"):
+                apply_mcp_command(root, "auth", "github", "literal-secret-value!")
+
     def test_workspace_files_do_not_require_git_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -50,11 +139,15 @@ class ModeAndKeyTests(unittest.TestCase):
                 try:
                     tree = get_project_tree.invoke({})
                     readme = read_safe_file.invoke({"path": "README.md"})
+                    missing = read_safe_file.invoke({"path": "roadmap.md"})
+                    denied = read_safe_file.invoke({"path": ".aws/credentials"})
                     status = get_git_status.invoke({})
                 finally:
                     reset_active_workspace(token)
             self.assertIn("README.md", tree)
             self.assertIn("Workspace instructions", readme)
+            self.assertEqual(missing, "Error: file not found: roadmap.md")
+            self.assertIn("Access denied", denied)
             self.assertIn("Git metadata is not available", status)
 
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
@@ -82,7 +175,7 @@ class ModeAndKeyTests(unittest.TestCase):
             self.assertIn("workspace/README.md", status)
 
     @unittest.skipUnless(shutil.which("bwrap"), "Bubblewrap is not installed")
-    def test_git_read_tools_can_read_repo_config_without_exposing_it_to_commands(self):
+    def test_user_directed_git_status_reads_config_but_model_command_cannot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "init", "-q", "-b", "main", str(root)], check=True)
@@ -94,11 +187,15 @@ class ModeAndKeyTests(unittest.TestCase):
                     self.assertIn("##", status)
                     self.assertIn("note.txt", status)
                     command = _run_command("test -s .git/config", shell=True)
+                    direct_status = execute_direct_command("git status --short --untracked-files=all")
+                    direct_config = execute_direct_command("test -s .git/config")
                 finally:
                     reset_active_workspace(token)
             self.assertIn("##", status)
             self.assertIn("note.txt", status)
             self.assertIn("Exit code: 1", command)
+            self.assertIn("note.txt", direct_status)
+            self.assertIn("Exit code: 0", direct_config)
 
     def test_regular_threads_are_shared_and_dev_thread_is_private(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -376,6 +473,56 @@ class TUIKeyTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CLIKeyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_command_uses_sandboxed_argv_and_reports_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            token = set_active_workspace(root)
+            try:
+                with patch("tools._sandbox_command", return_value=[
+                    "/bin/sh", "-c", "printf '%s' 'a b'",
+                ]) as sandbox:
+                    result = await execute_command_async("printf '%s' 'a b'")
+                sandbox.assert_called_once_with(
+                    "printf '%s' 'a b'", shell=True, cwd=root, expose_git_config=False,
+                )
+                self.assertIn("Exit code: 0", result)
+                self.assertIn("STDOUT:\na b", result)
+                with patch("tools._sandbox_command", return_value=[
+                    "/bin/sh", "-c", "printf failed >&2; exit 7",
+                ]):
+                    failure = await execute_command_async("printf failed >&2; exit 7")
+                self.assertIn("Exit code: 7", failure)
+                self.assertIn("STDERR:\nfailed", failure)
+                with patch("tools._sandbox_command", return_value=[
+                    "/bin/sh", "-c", "printf direct",
+                ]) as sandbox:
+                    direct = await execute_command_async("printf direct", user_directed=True)
+                sandbox.assert_called_once_with(
+                    "printf direct", shell=True, cwd=root, expose_git_config=True,
+                )
+                self.assertIn("STDOUT:\ndirect", direct)
+            finally:
+                reset_active_workspace(token)
+
+    async def test_direct_cli_command_runs_without_model_turn_or_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("main.__file__", str(root / "main.py")), patch("main.APP_ROOT", root):
+                with patch("main.setup_agent", new=AsyncMock(return_value=(object(), {}))) as setup:
+                    with patch("builtins.input", side_effect=[
+                        '/run pwd', '/trust informed-trust 2', '/run pwd',
+                        '/trust yes-trust', '/run printf "%s" "a b"', 'exit',
+                    ]):
+                        with patch("main._ask_cli_approval", side_effect=AssertionError("unexpected approval")) as approval:
+                            with patch("main.execute_direct_command", return_value="Exit code: 0\nSTDOUT:\na b") as command_tool, patch("main.console"):
+                                await run_agent()
+            setup.assert_awaited_once()
+            approval.assert_not_called()
+            self.assertEqual(
+                [call.args[0] for call in command_tool.call_args_list],
+                ["pwd", "pwd", 'printf "%s" "a b"'],
+            )
+
     async def test_normal_agent_loads_user_mcp_tools(self):
         with patch("main.DEV_MODE", False), patch("main._load_docs_tools", new=AsyncMock(return_value=[])):
             with patch("main._load_configured_mcp_tools", new=AsyncMock(return_value=[])) as configured:

@@ -515,7 +515,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(app.agent.calls, 2)
                         saved = load_plan(root, plan.session_id, plan.plan_id)
                         self.assertEqual(saved.status, "active")
-                        self.assertIn("Next plan step: Implement the requested work", saved.last_error)
+                        self.assertIn(f"Next plan step: {plan.steps[1].title}", saved.last_error)
                         self.assertIn("Last observed tool: read_safe_file", saved.last_error)
                         self.assertIn("No file edit was observed", saved.last_error)
                         self.assertEqual(app.conversation_store.load(), [])

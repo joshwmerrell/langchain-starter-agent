@@ -2,7 +2,7 @@
 
 from .archive import ArchiveManager
 from .cli import (
-    add_planning_arguments, continuation_instruction, latest_completed_context,
+    accepted_offer_instruction, add_planning_arguments, continuation_instruction, latest_completed_context,
     parse_request, planning_context, resume_or_create,
 )
 from .executors import PlanExecutor
@@ -26,6 +26,7 @@ __all__ = [
     "ThreadRecord",
     "TRUST_MODES",
     "active_plan",
+    "accepted_offer_instruction",
     "add_planning_arguments",
     "create_plan",
     "continuation_instruction",

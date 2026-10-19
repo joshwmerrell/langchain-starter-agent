@@ -1,4 +1,6 @@
 import ast
+import asyncio
+import codecs
 import difflib
 import json
 import os
@@ -20,7 +22,7 @@ from langchain.tools import tool
 from langchain_core.tools import StructuredTool
 
 from dependency_analysis import DependencyGraph, analyze_change_impact
-from wallace_mcp import all_mcp_servers, connection_status
+from wallace_mcp import all_mcp_servers, connection_details, connection_status
 from wallace_runtime import APP_ROOT, DEV_MODE, WORKSPACE_ROOT
 from wallace_status import current_status_text
 
@@ -65,6 +67,10 @@ MAX_TREE_ENTRIES = 300
 MAX_WRITE_CHARS = 50_000
 MAX_REPLACEMENT_CHARS = 25_000
 MAX_LINE_EDIT_LINES = 80
+MAX_EDIT_FILE_BYTES = 2_000_000
+MAX_READ_SCAN_CHARS = 4_000_000
+MAX_SEARCH_FILES = 2000
+MAX_TREE_DEPTH = 12
 COMMAND_TIMEOUT = 30
 SOURCE_CHECK_TIMEOUT = 60
 TEST_TIMEOUT = 180
@@ -95,10 +101,13 @@ def _tool_environment() -> dict[str, str]:
         and name.upper() not in {
             "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "DBUS_SESSION_BUS_ADDRESS",
             "XDG_RUNTIME_DIR", "PYTHONPATH", "WALLACE_DEV_MODE",
+            "API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIALS",
         }
     }
     environment["HOME"] = "/tmp"
-    environment["PATH"] = str(APP_ROOT / ".venv" / "bin") + os.pathsep + "/usr/bin:/bin"
+    environment["PATH"] = os.pathsep.join(dict.fromkeys([
+        str(APP_ROOT / ".venv" / "bin"), str(Path(sys.executable).parent), "/usr/bin", "/bin",
+    ]))
     return environment
 
 
@@ -130,7 +139,7 @@ def _resolve(path: str) -> Path | None:
     """
     try:
         target = (current_workspace_root() / path).resolve()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return None
     return target if _is_allowed(target) else None
 
@@ -141,7 +150,18 @@ def _resolve_writable(path: str) -> Path | None:
     return target
 
 
-def _atomic_write_text(target: Path, content: str) -> None:
+def _read_edit_text(target: Path) -> str:
+    """Bound whole-file operations such as exact editing and syntax parsing."""
+    if target.stat().st_size > MAX_EDIT_FILE_BYTES:
+        raise ValueError(f"file exceeds {MAX_EDIT_FILE_BYTES}-byte edit/check limit; use a targeted command")
+    with target.open(encoding="utf-8") as stream:
+        text = stream.read(MAX_EDIT_FILE_BYTES + 1)
+    if len(text) > MAX_EDIT_FILE_BYTES:
+        raise ValueError(f"file exceeds {MAX_EDIT_FILE_BYTES}-character edit/check limit; use a targeted command")
+    return text
+
+
+def _atomic_write_text(target: Path, content: str, *, expected_text: str | None = None) -> None:
     """Write text beside the target and replace it atomically."""
     target.parent.mkdir(parents=True, exist_ok=True)
     mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
@@ -161,6 +181,8 @@ def _atomic_write_text(target: Path, content: str) -> None:
             os.fsync(temporary.fileno())
         if mode is not None:
             os.chmod(temporary_path, mode)
+        if expected_text is not None and _read_edit_text(target) != expected_text:
+            raise ValueError("file changed during this edit; re-read it before retrying")
         os.replace(temporary_path, target)
     finally:
         if temporary_path is not None:
@@ -175,9 +197,66 @@ def _truncate_middle(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     """Keep the start and (more of) the end of long output; errors are usually last."""
     if len(text) <= limit:
         return text
-    head = limit // 3
-    tail = limit - head
-    return f"{text[:head]}\n...[{len(text) - limit} characters omitted]...\n{text[-tail:]}"
+    marker = f"\n...[output shortened; {len(text)} characters total]...\n"
+    if len(marker) >= limit:
+        return text[:max(0, limit)]
+    remaining = limit - len(marker)
+    head = remaining // 3
+    tail = remaining - head
+    return f"{text[:head]}{marker}{text[-tail:]}"
+
+
+class _OutputBuffer:
+    """Keep a bounded prefix and suffix while draining a command's output."""
+
+    def __init__(self, limit: int = MAX_OUTPUT_CHARS):
+        self.limit = limit
+        self.head = ""
+        self.tail = ""
+        self.total = 0
+
+    def append(self, text: str) -> None:
+        self.total += len(text)
+        self.tail = (self.tail + text)[-self.limit:]
+        missing = self.limit - len(self.head)
+        if missing > 0:
+            self.head += text[:missing]
+
+    def text(self) -> str:
+        if self.total <= self.limit:
+            return self.head
+        marker = f"\n...[output shortened; {self.total} characters total]...\n"
+        remaining = max(0, self.limit - len(marker))
+        head = remaining // 3
+        tail = remaining - head
+        return self.head[:head] + marker + (self.tail or self.head)[-tail:]
+
+
+def _spooled_output(stream) -> str:
+    """Read only the useful ends of a subprocess spool, never its whole contents."""
+    size = stream.seek(0, os.SEEK_END)
+    stream.seek(0)
+    if size <= MAX_OUTPUT_CHARS:
+        return stream.read(MAX_OUTPUT_CHARS).decode("utf-8", errors="replace")
+    prefix = stream.read(MAX_OUTPUT_CHARS).decode("utf-8", errors="replace")
+    stream.seek(max(0, size - MAX_OUTPUT_CHARS))
+    suffix = stream.read(MAX_OUTPUT_CHARS).decode("utf-8", errors="replace")
+    return _truncate_middle(prefix + f"\n...[{size} output bytes total]...\n" + suffix)
+
+
+def _command_result(returncode: int, stdout: str, stderr: str, *, timeout: int | None = None) -> str:
+    heading = (
+        f"Error: Command timed out after {timeout} seconds. Narrow the command or test target."
+        if timeout is not None else f"Exit code: {returncode}"
+    )
+    parts = [heading]
+    if stdout.strip():
+        parts.append(f"STDOUT:\n{stdout.strip()}")
+    if stderr.strip():
+        parts.append(f"STDERR:\n{stderr.strip()}")
+    if returncode < 0 and timeout is None:
+        parts.append(f"Process was terminated by signal {-returncode}.")
+    return _truncate_middle("\n".join(parts))
 
 
 def _sandbox_command(
@@ -208,6 +287,15 @@ def _sandbox_command(
     virtualenv = APP_ROOT / ".venv"
     if root != APP_ROOT.resolve() and virtualenv.is_dir():
         command.extend(["--ro-bind", str(virtualenv), str(virtualenv)])
+    running_environment = Path(sys.prefix).resolve()
+    if (
+        (running_environment / "pyvenv.cfg").is_file()
+        and not running_environment.is_relative_to(root)
+        and running_environment != virtualenv.resolve()
+    ):
+        # An isolated checkout may run with another checkout's environment.
+        # Bind only that Python environment, never the neighboring source tree.
+        command.extend(["--ro-bind", str(running_environment), str(running_environment)])
     interpreter = Path(sys.executable).resolve()
     if not interpreter.is_relative_to(Path("/usr")) and not interpreter.is_relative_to(Path("/bin")):
         distribution = interpreter.parent.parent
@@ -278,33 +366,33 @@ def _run_command(
             args, shell=shell, cwd=working, expose_git_config=expose_git_config,
             sandbox_root=sandbox_root,
         )
-        r = subprocess.run(
-            sandboxed,
-            shell=False,
-            cwd=working,
-            env=_tool_environment(),
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            stdin=subprocess.DEVNULL if input_text is None else None,
-            input=input_text,
-        )
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds."
+        # Spool outside Python's heap: noisy compilers/tests must not consume
+        # unlimited RAM before their results can be shortened for the model.
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                result = subprocess.run(
+                    sandboxed,
+                    shell=False,
+                    cwd=working,
+                    env=_tool_environment(),
+                    stdout=stdout,
+                    stderr=stderr,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    stdin=subprocess.DEVNULL if input_text is None else None,
+                    input=input_text,
+                )
+            except subprocess.TimeoutExpired:
+                return _command_result(-1, _spooled_output(stdout), _spooled_output(stderr), timeout=timeout)
+            return _command_result(
+                result.returncode, _spooled_output(stdout), _spooled_output(stderr),
+            )
     except FileNotFoundError:
         name = args[0] if isinstance(args, list) else args
         return f"Error: '{name}' is not installed."
     except Exception as e:
         return f"Error executing command: {e}"
-
-    parts = [f"Exit code: {r.returncode}"]
-    if r.stdout.strip():
-        parts.append(f"STDOUT:\n{r.stdout.strip()}")
-    if r.stderr.strip():
-        parts.append(f"STDERR:\n{r.stderr.strip()}")
-    return _truncate_middle("\n".join(parts))
-
 
 def _git_available(root: Path | None = None) -> bool:
     """Return whether the selected workspace contains Git metadata."""
@@ -433,22 +521,32 @@ def get_project_tree(path: str = ".", max_depth: int = 2) -> str:
 
     Args:
         path: Directory relative to the project root. Defaults to the root.
-        max_depth: How many levels to show (default 2; use 1 for a plain listing).
+        max_depth: Levels to show, capped at 12 (default 2; use 1 for a plain listing).
     """
     target = _resolve(path)
     if target is None or not target.is_dir():
         return ACCESS_DENIED
 
-    max_depth = max(1, max_depth)
+    max_depth = max(1, min(max_depth, MAX_TREE_DEPTH))
     budget = [MAX_TREE_ENTRIES]
 
     def build(current: Path, prefix: str, depth: int) -> list[str]:
         try:
-            entries = sorted(
-                (e for e in current.iterdir()
-                 if e.name.lower() not in SKIP_DIRS and _is_allowed(e.resolve())),
-                key=lambda e: (e.is_file(), e.name.lower()),
-            )
+            entries = []
+            more = False
+            for entry in current.iterdir():
+                if entry.name.lower() in SKIP_DIRS:
+                    continue
+                try:
+                    if not _is_allowed(entry.resolve()):
+                        continue
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                if len(entries) >= budget[0]:
+                    more = True
+                    break
+                entries.append(entry)
+            entries.sort(key=lambda e: (e.is_file(), e.name.lower()))
         except OSError:
             return []
 
@@ -466,16 +564,21 @@ def get_project_tree(path: str = ".", max_depth: int = 2) -> str:
                     lines.extend(build(entry, prefix + ("    " if is_last else "│   "), depth + 1))
             else:
                 lines.append(f"{prefix}{connector}{entry.name}")
+        if more and budget[0] >= 0:
+            lines.append(f"{prefix}└── ...[more entries omitted; narrow path]")
         return lines
 
     lines = build(target, "", 1)
     heading = f"{target.relative_to(current_workspace_root()).as_posix()}/"
-    return heading + ("\n" + "\n".join(lines) if lines else " (empty)")
+    return _truncate_middle(heading + ("\n" + "\n".join(lines) if lines else " (empty)"), MAX_READ_CHARS)
 
 
 @tool
 def read_safe_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
-    """Read a UTF-8 text file from the project. Large files are cut off; use start_line/end_line to read a range.
+    """Read a workspace UTF-8 file or line range, with a strict output limit.
+
+    Small files are returned exactly. Follow the continuation hint for larger
+    files; use a targeted command to extract part of an oversized single line.
 
     Args:
         path: File path relative to the project root.
@@ -483,39 +586,67 @@ def read_safe_file(path: str, start_line: int = 1, end_line: int = 0) -> str:
         end_line: Last line to return, inclusive; 0 means the end of the file.
     """
     target = _resolve(path)
-    if target is None or not target.is_file():
+    if target is None:
         return ACCESS_DENIED
+    if not target.is_file():
+        return f"Error: file not found: {path}"
+    start = max(start_line, 1)
+    if 0 < end_line < start:
+        return "Error: end_line must be 0 or greater than or equal to start_line."
+    pieces: list[str] = []
+    size = scanned = total = 0
+    number = 1
+    last = start - 1
+    complete = False
+    partial_line = False
+    payload_limit = MAX_READ_CHARS - 256
     try:
-        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        with target.open(encoding="utf-8") as stream:
+            while True:
+                # readline(size) bounds even minified files with one giant line.
+                piece = stream.readline(min(8192, MAX_READ_SCAN_CHARS - scanned + 1))
+                if not piece:
+                    complete = True
+                    break
+                scanned += len(piece)
+                total = number
+                if scanned > MAX_READ_SCAN_CHARS:
+                    if not pieces:
+                        return f"Error: scan limit reached before line {start}. Use an earlier range or a targeted command."
+                    break
+                if number >= start:
+                    available = payload_limit - size
+                    if len(piece) > available:
+                        if available:
+                            pieces.append(piece[:available])
+                            last = number
+                        partial_line = last == number
+                        break
+                    pieces.append(piece)
+                    size += len(piece)
+                    last = number
+                if piece.endswith("\n"):
+                    number += 1
+                    if end_line > 0 and number > end_line:
+                        complete = not stream.read(1)
+                        break
     except UnicodeDecodeError:
         return "Error: file is not valid UTF-8 text."
     except OSError as error:
         return f"Error reading file: {error}"
-
-    total = len(lines)
     if total == 0:
         return "(empty file)"
-    start = max(start_line, 1)
-    end = total if end_line <= 0 else min(end_line, total)
-    if start > total:
+    if not pieces and complete:
         return f"Error: file has only {total} lines."
-
-    chunk, size, last = [], 0, start - 1
-    for number in range(start, end + 1):
-        line = lines[number - 1]
-        if size + len(line) > MAX_READ_CHARS and chunk:
-            break
-        chunk.append(line)
-        size += len(line)
-        last = number
-
-    text = "".join(chunk)
-    if start == 1 and last == total:
+    text = "".join(pieces)
+    if start == 1 and complete:
         return text  # whole file: return it exactly as is
-    note = f"[lines {start}-{last} of {total}]\n"
-    if last < end:
+    note = f"[lines {start}-{last}" + (f" of {total}]\n" if complete else "]\n")
+    if partial_line:
+        text += f"\n[line {last} truncated; use a targeted command to extract the needed part of this line]"
+    elif not complete and (end_line <= 0 or last < end_line):
         text += f"\n[cut off to save space; continue with start_line={last + 1}]"
-    return note + text
+    return _truncate_middle(note + text, MAX_READ_CHARS)
 
 
 @tool
@@ -552,25 +683,44 @@ def search_in_files(
                     yield Path(root) / name
 
     matches: list[str] = []
-    for file in iter_files():
-        resolved = file.resolve()
+    output_size = 0
+    skipped_large = 0
+    for index, file in enumerate(iter_files(), 1):
+        if index > MAX_SEARCH_FILES:
+            return "\n".join(matches + [f"[stopped after {MAX_SEARCH_FILES} files; narrow path or file_glob]"])
+        try:
+            resolved = file.resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
         if not _is_allowed(resolved):
             continue
         try:
             if resolved.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                skipped_large += 1
                 continue
-            text = resolved.read_text(encoding="utf-8")
+            with resolved.open("rb") as stream:
+                data = stream.read(MAX_SEARCH_FILE_BYTES + 1)
+            if len(data) > MAX_SEARCH_FILE_BYTES:
+                skipped_large += 1
+                continue
+            text = data.decode("utf-8")
         except (OSError, UnicodeDecodeError):
             continue  # unreadable or binary
         rel = resolved.relative_to(current_workspace_root()).as_posix()
         for number, line in enumerate(text.splitlines(), 1):
             if regex.search(line):
-                matches.append(f"{rel}:{number}: {line.strip()[:200]}")
+                match = f"{rel}:{number}: {line.strip()[:200]}"
+                if output_size + len(match) + 160 > MAX_OUTPUT_CHARS:
+                    return "\n".join(matches + ["[output limit reached; narrow pattern, path, or file_glob]"])
+                matches.append(match)
+                output_size += len(match) + 1
                 if len(matches) >= MAX_SEARCH_MATCHES:
                     matches.append(
                         f"[stopped at {MAX_SEARCH_MATCHES} matches; narrow the pattern, path, or file_glob]"
                     )
                     return "\n".join(matches)
+    if skipped_large:
+        matches.append(f"[skipped {skipped_large} files larger than {MAX_SEARCH_FILE_BYTES} bytes]")
     return "\n".join(matches) or "No matches found."
 
 
@@ -597,15 +747,15 @@ def get_code_symbols(path: str) -> str:
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
     try:
-        tree = ast.parse(target.read_text(encoding="utf-8"), filename=path)
+        tree = ast.parse(_read_edit_text(target), filename=path)
     except SyntaxError as error:
         return f"Error: syntax error on line {error.lineno}: {error.msg}"
-    except (OSError, UnicodeDecodeError) as error:
+    except (OSError, UnicodeDecodeError, ValueError) as error:
         return f"Error reading file: {error}"
 
     symbols: list[str] = []
     _collect_symbols(tree, "", symbols)
-    return "\n".join(symbols) or "No classes or functions found."
+    return _truncate_middle("\n".join(symbols), MAX_READ_CHARS) or "No classes or functions found."
 
 
 @tool
@@ -626,10 +776,10 @@ def check_python_syntax(path: str) -> str:
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
     try:
-        compile(target.read_text(encoding="utf-8"), path, "exec", dont_inherit=True)
+        compile(_read_edit_text(target), path, "exec", dont_inherit=True)
     except SyntaxError as error:
         return f"Error: Python syntax error in {path}, line {error.lineno}: {error.msg}"
-    except (OSError, UnicodeDecodeError) as error:
+    except (OSError, UnicodeDecodeError, ValueError) as error:
         return f"Error reading file: {error}"
     return f"OK: {path} has valid Python syntax."
 
@@ -653,7 +803,7 @@ def check_source_file(path: str) -> str:
         return check_python_syntax.invoke({"path": path})
     if suffix in {".json", ".toml"}:
         try:
-            source = target.read_text(encoding="utf-8")
+            source = _read_edit_text(target)
             json.loads(source) if suffix == ".json" else tomllib.loads(source)
         except (OSError, UnicodeDecodeError, ValueError) as error:
             return f"Error: invalid {suffix[1:]} in {path}: {error}"
@@ -662,8 +812,8 @@ def check_source_file(path: str) -> str:
         if shutil.which("deno") is None:
             return f"Error: deno is not installed; cannot parse {path}."
         try:
-            source = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as error:
+            source = _read_edit_text(target)
+        except (OSError, UnicodeDecodeError, ValueError) as error:
             return f"Error reading {path}: {error}"
         result = _run_command(
             ["deno", "fmt", "--no-config", "--no-editorconfig", "--ext", suffix[1:], "-"],
@@ -731,7 +881,7 @@ def summarize_project_file(path: str) -> str:
     if target is None or not target.is_file() or target.suffix != ".py":
         return f"Error: '{path}' is not an accessible Python file."
     graph = DependencyGraph(current_workspace_root()).build()
-    return json.dumps(graph.summarize_module(target), indent=2)
+    return _truncate_middle(json.dumps(graph.summarize_module(target), indent=2), MAX_READ_CHARS)
 
 
 @tool
@@ -751,7 +901,7 @@ def analyze_project_dependencies() -> str:
         lines.append(
             "Declared packages: " + ", ".join(sorted(graph.declared_dependencies))
         )
-    return "\n".join(lines)
+    return _truncate_middle("\n".join(lines), MAX_READ_CHARS)
 
 
 @tool
@@ -825,7 +975,7 @@ def analyze_git_change_impact(staged: bool = False) -> str:
         return "No changed Python files found."
     graph = DependencyGraph(root).build()
     impacts = analyze_change_impact({"diff": changes}, graph)
-    return json.dumps(impacts, indent=2) if impacts else "No Git changes found."
+    return _truncate_middle(json.dumps(impacts, indent=2), MAX_READ_CHARS) if impacts else "No Git changes found."
 
 
 # ---------------------------------------------------------------------------
@@ -897,21 +1047,21 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
         return "Error: old_text must not be empty."
     if old_text == new_text:
         return "Error: old_text and new_text are identical."
-    if len(new_text) > MAX_REPLACEMENT_CHARS:
+    if len(old_text) > MAX_REPLACEMENT_CHARS or len(new_text) > MAX_REPLACEMENT_CHARS:
         return (
-            f"Error: replacement is {len(new_text)} characters; the maximum is "
+            f"Error: edit block is {max(len(old_text), len(new_text))} characters; the maximum is "
             f"{MAX_REPLACEMENT_CHARS}. Use a short edit."
         )
     try:
-        text = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        text = _read_edit_text(target)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
         return f"Error reading {path}: {error}"
 
     count = text.count(old_text)
     if count == 0:
         # A ranged read includes a display-only line-number header. Models
         # sometimes copy that header together with the real anchor.
-        without_header = re.sub(r"^\[lines \d+-\d+ of \d+\]\n", "", old_text, count=1)
+        without_header = re.sub(r"^\[lines \d+-\d+(?: of \d+)?\]\n", "", old_text, count=1)
         if without_header != old_text:
             old_text = without_header
             count = text.count(old_text)
@@ -927,8 +1077,8 @@ def replace_in_file(path: str, old_text: str, new_text: str) -> str:
     if syntax_error is not None:
         return syntax_error
     try:
-        _atomic_write_text(target, updated)
-    except OSError as error:
+        _atomic_write_text(target, updated, expected_text=text)
+    except (OSError, ValueError) as error:
         return f"Error writing {path}: {error}"
     return f"Edited {path}."
 
@@ -958,8 +1108,8 @@ def edit_file_lines(path: str, start_line: int, end_line: int, new_text: str) ->
             f"{MAX_REPLACEMENT_CHARS}. Use a short edit."
         )
     try:
-        original = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
+        original = _read_edit_text(target)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
         return f"Error reading {path}: {error}"
     lines = original.splitlines(keepends=True)
     if not (1 <= start_line <= len(lines) + 1 and start_line - 1 <= end_line <= len(lines)):
@@ -983,8 +1133,8 @@ def edit_file_lines(path: str, start_line: int, end_line: int, new_text: str) ->
     if syntax_error is not None:
         return syntax_error
     try:
-        _atomic_write_text(target, updated)
-    except OSError as error:
+        _atomic_write_text(target, updated, expected_text=original)
+    except (OSError, ValueError) as error:
         return f"Error writing {path}: {error}"
     return f"Edited {path} lines {start_line}-{end_line}."
 
@@ -995,14 +1145,14 @@ def preview_line_edit(path: str, start_line: int, end_line: int, new_text: str) 
     if target is None or not target.is_file():
         return f"Path: {path}\n(this path is not writable)"
     try:
-        lines = target.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return f"Path: {path}\n(existing file could not be read)"
+        lines = _read_edit_text(target).splitlines()
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return f"Path: {path}\n(existing file could not be read: {error})"
     if not (1 <= start_line <= len(lines) + 1 and start_line - 1 <= end_line <= len(lines)):
         return f"Path: {path}\n(invalid line range; file has {len(lines)} lines)"
     removed = [f"- {line}" for line in lines[start_line - 1:end_line]]
     added = [f"+ {line}" for line in new_text.splitlines()]
-    return f"Path: {path}\nLines: {start_line}-{end_line}\n\n" + "\n".join(removed + added)
+    return _truncate_middle(f"Path: {path}\nLines: {start_line}-{end_line}\n\n" + "\n".join(removed + added), MAX_READ_CHARS)
 
 
 def preview_write(path: str, content: str) -> str:
@@ -1010,17 +1160,19 @@ def preview_write(path: str, content: str) -> str:
     target = _resolve_writable(path)
     if target is None:
         return f"Path: {path}\n(this path is not writable)"
+    if len(content) > MAX_WRITE_CHARS:
+        return f"Path: {path}\n(content exceeds {MAX_WRITE_CHARS}-character write limit; use a small exact edit)"
     if not target.is_file():
         added = "\n".join("+ " + line for line in content.splitlines())
-        return f"Path: {path}\n(new file)\n\n{added}"
+        return _truncate_middle(f"Path: {path}\n(new file)\n\n{added}", MAX_READ_CHARS)
     try:
-        old = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return f"Path: {path}\n(existing file could not be read)\n\n{content}"
+        old = _read_edit_text(target)
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return f"Path: {path}\n(existing file could not be read: {error})"
     diff = "\n".join(difflib.unified_diff(
         old.splitlines(), content.splitlines(), "current", "proposed", lineterm="", n=2
     ))
-    return f"Path: {path}\n\n{diff or '(no changes)'}"
+    return _truncate_middle(f"Path: {path}\n\n{diff or '(no changes)'}", MAX_READ_CHARS)
 
 
 # ---------------------------------------------------------------------------
@@ -1029,34 +1181,77 @@ def preview_write(path: str, content: str) -> str:
 
 @tool
 def list_mcp_connections() -> str:
-    """List MCP server URLs and live connection states, without changing them.
+    """List MCP endpoints, live connection states, discovery errors, and tool names.
 
-    MCP management is user-only through the TUI's /mcp commands. Do not edit
+    MCP management is user-only through the TUI or CLI /mcp commands. Do not edit
     the private MCP registry with shell commands.
     """
     try:
         servers = all_mcp_servers(APP_ROOT)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return f"Error: MCP configuration could not be read: {error}"
-    return json.dumps({"servers": [
-        {
+    entries = []
+    for server in servers:
+        details = connection_details(server)
+        names = details["tools"]
+        endpoint = server.url if server.transport == "http" else f"stdio: {server.command}"
+        entries.append({
             "name": server.name,
-            "url": server.url,
+            "url": endpoint[:256],
             "active": server.enabled,
             "connection": connection_status(server),
+            "auth_env_configured": bool(server.auth_env),
+            "diagnostic": str(details["detail"])[:250],
+            "tools": [str(name)[:80] for name in names[:20]],
+            "tool_count": len(names),
             "built_in": server.builtin,
-            "keywords": server.keywords,
-        }
-        for server in servers
-    ]})
+            "keywords": server.keywords[:6],
+        })
+        if len(endpoint) > 256:
+            entries[-1]["url_shortened"] = True
+    # Keep JSON valid when a server exposes hundreds of tools. The counts make
+    # omitted names explicit, unlike cutting through a serialized document.
+    while True:
+        for entry in entries:
+            entry["tools_omitted"] = entry["tool_count"] - len(entry["tools"])
+        result = json.dumps({"servers": entries})
+        if len(result) <= MAX_READ_CHARS:
+            return result
+        largest = max(entries, key=lambda entry: len(entry["tools"]), default=None)
+        if largest is None or not largest["tools"]:
+            return json.dumps({"error": "MCP status exceeds the output limit; inspect servers through /mcp."})
+        largest["tools"].pop()
 
 @tool
 def execute_command(command: str) -> str:
-    """Run a shell command in the project root (30 second limit, no interactive input). Output is shortened if long.
+    """Run a noninteractive workspace shell command (30 seconds; bounded output).
+
+    Commands use the same scoped filesystem sandbox as tests. Use file tools
+    for reading and editing; narrow noisy commands so useful diagnostics fit.
 
     Args:
         command: The shell command, e.g. "python main.py" or "pip list".
     """
+    missing_target = _missing_removal_target(command)
+    if missing_target is not None:
+        return missing_target
+    return _run_command(command, shell=True)
+
+
+def execute_direct_command(command: str) -> str:
+    """Run a user-entered /run command, retaining the scoped command sandbox.
+
+    Unlike model calls, direct commands may read the repository's Git config
+    so ordinary `git status` works. Other private paths remain masked.
+    """
+    missing_target = _missing_removal_target(command)
+    if missing_target is not None:
+        return missing_target
+    return _run_command(command, shell=True, expose_git_config=True)
+
+
+def _missing_removal_target(command: str) -> str | None:
+    """Keep direct and model command paths consistent for repeated removals."""
     # `rm -rf` succeeds even when its target has already gone. Avoid reporting
     # repeated no-op removals as completed work, especially on resumed plans.
     try:
@@ -1076,7 +1271,59 @@ def execute_command(command: str) -> str:
                     "Do not repeat removal. Verify absence, then call "
                     "run_tests(test_path='.') for the remaining checks."
                 )
-    return _run_command(command, shell=True)
+    return None
+
+
+async def execute_command_async(command: str, *, user_directed: bool = False) -> str:
+    """Run a scoped command without blocking the TUI event loop.
+
+    Only the host's direct /run path passes user_directed=True; model-invoked
+    commands continue to have the repository Git config masked.
+    """
+    missing_target = _missing_removal_target(command)
+    if missing_target is not None:
+        return missing_target
+    try:
+        working = current_workspace_root()
+        sandboxed = _sandbox_command(
+            command, shell=True, cwd=working, expose_git_config=user_directed,
+        )
+        process = await asyncio.create_subprocess_exec(
+            *sandboxed, cwd=working, env=_tool_environment(),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout = _OutputBuffer()
+        stderr = _OutputBuffer()
+
+        async def drain(stream, output: _OutputBuffer) -> None:
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+            while data := await stream.read(8192):
+                output.append(decoder.decode(data))
+            output.append(decoder.decode(b"", final=True))
+
+        readers = [asyncio.create_task(drain(process.stdout, stdout)),
+                   asyncio.create_task(drain(process.stderr, stderr))]
+        try:
+            await asyncio.wait_for(asyncio.gather(process.wait(), *readers), COMMAND_TIMEOUT)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            return _command_result(-1, stdout.text(), stderr.text(), timeout=COMMAND_TIMEOUT)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(process.wait(), *readers, return_exceptions=True)
+            raise
+    except FileNotFoundError:
+        return "Error: 'bwrap' is not installed."
+    except Exception as error:
+        return f"Error executing command: {error}"
+    return _command_result(process.returncode, stdout.text(), stderr.text())
 
 
 @tool
@@ -1105,7 +1352,10 @@ def run_tests(test_path: str = ".") -> str:
         command = [sys.executable, "-m", "unittest", "discover", "-s", discover_root]
         if target.is_file():
             command.extend(["-p", target.name])
-    return _run_command(command, timeout=TEST_TIMEOUT)
+    result = _run_command(command, timeout=TEST_TIMEOUT)
+    if result.startswith("Exit code: 0") and re.search(r"\bRan 0 tests\b|\bno tests ran\b", result, re.IGNORECASE):
+        return _truncate_middle("Error: no tests were discovered. Choose the test file or directory explicitly.\n" + result)
+    return result
 
 
 @tool
@@ -1177,7 +1427,8 @@ def verify_tool_contract(tool_name: str, test_path: str) -> str:
 
     In the source thread, verify Wallace's built-in registry. In an ordinary
     workspace, verify a local @tool definition without exposing Wallace source.
-    The test must call the tool's invoke method; unrelated tests are not enough.
+    A test must assert the result of the tool's invoke method, and at least
+    one test must actually run; unrelated or undiscovered tests are not enough.
 
     Args:
         tool_name: Exact name of a registered built-in or a workspace @tool.
@@ -1192,21 +1443,63 @@ def verify_tool_contract(tool_name: str, test_path: str) -> str:
         tree = ast.parse(target.read_text(encoding="utf-8"), filename=test_path)
     except (OSError, UnicodeDecodeError, SyntaxError) as error:
         return f"Error: could not inspect test file: {error}"
+    def invokes_tool(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "invoke"
+            and isinstance(child.func.value, ast.Name)
+            and child.func.value.id == tool_name
+            for child in ast.walk(node)
+        )
+
     exercised = any(
         isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
         and function.name.startswith("test_")
-        and any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "invoke"
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == tool_name
-            for node in ast.walk(function)
-        )
+        and invokes_tool(function)
         for function in ast.walk(tree)
     )
     if not exercised:
         return f"Error: a test_ function in {test_path} must call {tool_name}.invoke(...)."
+    def asserts_tool_result(function: ast.AST) -> bool:
+        assigned = {
+            name.id
+            for node in ast.walk(function)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and node.value is not None
+            and invokes_tool(node.value)
+            for target_node in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            for name in ast.walk(target_node)
+            if isinstance(name, ast.Name)
+        }
+        for node in ast.walk(function):
+            expression = None
+            if isinstance(node, ast.Assert):
+                expression = node.test
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr.startswith("assert")
+            ):
+                expression = node
+            if expression is not None and (
+                invokes_tool(expression)
+                or any(
+                    isinstance(child, ast.Name) and child.id in assigned
+                    for child in ast.walk(expression)
+                )
+            ):
+                return True
+        return False
+
+    asserted = any(
+        isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and function.name.startswith("test_")
+        and asserts_tool_result(function)
+        for function in ast.walk(tree)
+    )
+    if not asserted:
+        return f"Error: a test_ function invoking {tool_name} must assert the expected result."
     source_thread = current_workspace_root().resolve() == APP_ROOT.resolve()
     if source_thread:
         registry = _run_command([
@@ -1256,6 +1549,11 @@ def verify_tool_contract(tool_name: str, test_path: str) -> str:
     result = run_tests.invoke({"test_path": test_path})
     if not result.startswith("Exit code: 0"):
         return f"Error: contract tests failed for {tool_name}. {result}"
+    if not (
+        re.search(r"\bRan [1-9][0-9]* tests?\b", result)
+        or re.search(r"\b[1-9][0-9]* passed\b", result)
+    ):
+        return f"Error: contract tests for {tool_name} reported no executed tests. {result}"
     if source_thread:
         return f"OK: {tool_name} is registered; {test_path} contains a test invocation and its tests pass."
     return (

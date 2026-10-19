@@ -21,7 +21,8 @@ from tools import (
 )
 from wallace_mcp import (
     add_mcp_server, all_mcp_servers, clear_connection_statuses,
-    load_mcp_servers, remove_mcp_server, set_connection_status,
+    apply_mcp_command, load_mcp_servers, mcp_failure_summary, parse_mcp_command,
+    remove_mcp_server, set_connection_status,
     set_mcp_server_active, tui_applied_current_config,
 )
 from wallace_tool_selection import select_tools
@@ -223,17 +224,43 @@ class ToolBuildingTests(unittest.TestCase):
                 self.assertIn("must call new_tool.invoke", verify_tool_contract.invoke({
                     "tool_name": "new_tool", "test_path": test.name,
                 }))
-                test.write_text("def test_new_tool():\n    new_tool.invoke({'path': 'x'})\n")
+                test.write_text("def test_new_tool():\n    assert new_tool.invoke({'path': 'x'}) == 'ok'\n")
                 with patch("tools._run_command", return_value="Exit code: 1"):
                     self.assertIn("not registered", verify_tool_contract.invoke({
                         "tool_name": "new_tool", "test_path": test.name,
                     }))
                 with patch("tools._run_command", return_value="Exit code: 0"):
-                    with patch("tools.run_tests", SimpleNamespace(invoke=lambda args: "Exit code: 0")):
+                    with patch("tools.run_tests", SimpleNamespace(invoke=lambda args: "Exit code: 0\nRan 1 test")):
                         result = verify_tool_contract.invoke({
                             "tool_name": "new_tool", "test_path": test.name,
                         })
             self.assertIn("registered", result)
+
+    def test_tool_contract_rejects_unasserted_or_undiscovered_test(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test = root / "test_new_tool.py"
+            with patch("tools.SAFE_ROOT", root), patch("tools.APP_ROOT", root):
+                test.write_text("def test_new_tool():\n    new_tool.invoke({'path': 'x'})\n")
+                self.assertIn("must assert", verify_tool_contract.invoke({
+                    "tool_name": "new_tool", "test_path": test.name,
+                }))
+                test.write_text("def test_new_tool():\n    new_tool.invoke({'path': 'x'})\n    assert True\n")
+                self.assertIn("must assert", verify_tool_contract.invoke({
+                    "tool_name": "new_tool", "test_path": test.name,
+                }))
+                test.write_text("def test_new_tool():\n    result = new_tool.invoke({'path': 'x'})\n    assert result == 'ok'\n")
+                with patch("tools._run_command", return_value="Exit code: 0"):
+                    with patch("tools.run_tests", SimpleNamespace(invoke=lambda args: "Exit code: 0\nRan 1 test")):
+                        self.assertIn("registered", verify_tool_contract.invoke({
+                            "tool_name": "new_tool", "test_path": test.name,
+                        }))
+                test.write_text("def test_new_tool():\n    assert new_tool.invoke({'path': 'x'}) == 'ok'\n")
+                with patch("tools._run_command", return_value="Exit code: 0"):
+                    with patch("tools.run_tests", SimpleNamespace(invoke=lambda args: "Exit code: 0\nRan 0 tests")):
+                        self.assertIn("no executed tests", verify_tool_contract.invoke({
+                            "tool_name": "new_tool", "test_path": test.name,
+                        }))
 
 
 class MCPAndSelectionTests(unittest.TestCase):
@@ -272,6 +299,7 @@ class MCPAndSelectionTests(unittest.TestCase):
             self.assertEqual(listed["servers"][0]["name"], "langchain-docs")
             self.assertEqual(listed["servers"][1]["url"], "https://example.com/mcp")
             self.assertEqual(listed["servers"][1]["connection"], "connected")
+            self.assertEqual(listed["servers"][1]["tools"], [])
             self.assertIn("list_mcp_connections", READ_ONLY_TOOLS)
             self.assertNotIn("add_mcp_server", {tool.name for tool in TOOLS})
             with patch("tools.SAFE_ROOT", root):
@@ -286,6 +314,27 @@ class MCPAndSelectionTests(unittest.TestCase):
                 listed = json.loads(list_mcp_connections.invoke({}))
             self.assertEqual(listed["servers"][1]["connection"], "inactive")
             clear_connection_statuses()
+
+    def test_mcp_connect_retries_only_configured_active_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            add_mcp_server(root, "github", "https://example.com/mcp")
+            self.assertEqual(
+                parse_mcp_command(["connect", "github"], root),
+                ("connect", "github", "", ()),
+            )
+            self.assertFalse(apply_mcp_command(root, "connect", "github"))
+            self.assertFalse(apply_mcp_command(root, "reload", ""))
+            with self.assertRaisesRegex(ValueError, "unknown MCP server"):
+                apply_mcp_command(root, "connect", "missing")
+            set_mcp_server_active(root, "github", False)
+            with self.assertRaisesRegex(ValueError, "inactive"):
+                apply_mcp_command(root, "connect", "github")
+            self.assertEqual(mcp_failure_summary(OSError("Temporary failure in name resolution")), "DNS lookup failed")
+            self.assertEqual(
+                mcp_failure_summary(Exception("Server returned an error response")),
+                "Remote server rejected MCP discovery; check the endpoint and authentication",
+            )
 
     def test_mcp_registry_rejects_unsafe_urls_even_when_inactive(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -341,11 +390,20 @@ class MCPAndSelectionTests(unittest.TestCase):
         prompt = "Prior thread context: fix Python bugs.\nUser request:\nShow my Drive files"
         selected = {tool.name for tool in select_tools(prompt, tools)}
         self.assertIn("list_drive", selected)
-        self.assertNotIn("check_source_file", selected)
-        self.assertNotIn("execute_command", selected)
+        # Local capabilities stay available without guessing the request's
+        # language or vocabulary; MCP keywords only add an optional tool.
+        self.assertTrue({"check_source_file", "execute_command"} <= selected)
         code_selected = {tool.name for tool in select_tools("Fix the Python tool", tools)}
         self.assertIn("check_source_file", code_selected)
         self.assertNotIn("list_drive", code_selected)
+        troubleshoot_selected = {tool.name for tool in select_tools("Troubleshoot this tool", tools)}
+        self.assertIn("check_source_file", troubleshoot_selected)
+        self.assertIn("execute_command", troubleshoot_selected)
+        roadmap_selected = {tool.name for tool in select_tools(
+            "Look at the roadmap and determine what to develop, build, and implement from there.", tools
+        )}
+        self.assertIn("check_source_file", roadmap_selected)
+        self.assertNotIn("execute_command", roadmap_selected)
         self.assertIn(
             "check_source_file",
             {tool.name for tool in select_tools("Create a website", tools)},
@@ -355,9 +413,66 @@ class MCPAndSelectionTests(unittest.TestCase):
             "list_mcp_connections",
             {tool.name for tool in select_tools("Which MCP servers are connected?", status_tools)},
         )
+        github_tool = SimpleNamespace(name="search_repositories", metadata={
+            "wallace_mcp": {"server": "github", "keywords": ("github",)},
+        })
+        self.assertIn(
+            "search_repositories",
+            {tool.name for tool in select_tools("Search GitHub repos", tools + [github_tool])},
+        )
+        reported = (
+            "The following error: MCP github is not connected. "
+            "Use /mcp add <name> or /mcp remove <name>."
+        )
+        self.assertNotIn("execute_command", {
+            tool.name for tool in select_tools(reported, tools)
+        })
 
 
 class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_github_http_mcp_requires_configured_bearer_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            add_mcp_server(root, "github", "https://api.githubcopilot.com/mcp/")
+            warnings = []
+            with patch("main.APP_ROOT", root), patch("main.MCPAdapter") as adapter:
+                self.assertEqual(await _load_configured_mcp_tools(warnings.append), [])
+                adapter.assert_not_called()
+            self.assertIn("/mcp auth github", warnings[0])
+            with patch("tools.APP_ROOT", root):
+                listed = json.loads(list_mcp_connections.invoke({}))
+            self.assertFalse(listed["servers"][1]["auth_env_configured"])
+            self.assertIn("access token", listed["servers"][1]["diagnostic"])
+
+            apply_mcp_command(root, "auth", "github", "GITHUB_MCP_TOKEN")
+            seen = []
+
+            class Adapter:
+                def __init__(self, target):
+                    seen.append(target)
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return None
+
+                async def list_tools(self):
+                    return [SimpleNamespace(name="search_repositories", metadata={})]
+
+            with patch.dict(os.environ, {"GITHUB_MCP_TOKEN": "test-secret"}):
+                with patch("main.APP_ROOT", root), patch("main.MCPAdapter", Adapter):
+                    discovered = await _load_configured_mcp_tools(lambda warning: self.fail(warning))
+            self.assertEqual([tool.name for tool in discovered], ["search_repositories"])
+            self.assertEqual(
+                seen[0]["mcpServers"]["github"]["headers"]["Authorization"],
+                "Bearer test-secret",
+            )
+            with patch("tools.APP_ROOT", root):
+                listed = json.loads(list_mcp_connections.invoke({}))
+            self.assertTrue(listed["servers"][1]["auth_env_configured"])
+            self.assertNotIn("test-secret", json.dumps(listed))
+
     async def test_cli_mcp_commands_rebuild_and_persist_choice(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -366,13 +481,16 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
                 with patch("main.setup_agent", new=setup):
                     with patch("builtins.input", side_effect=[
                         "/mcp add files https://example.com/mcp drive",
+                        "/mcp auth files TEST_MCP_TOKEN",
+                        "/mcp connect files",
                         "/mcp off files", "/mcp", "exit",
                     ]):
                         with patch("main.console"):
                             await run_agent()
-            self.assertEqual(setup.await_count, 3)
+            self.assertEqual(setup.await_count, 5)
             self.assertFalse(all_mcp_servers(root)[1].enabled)
             self.assertEqual(all_mcp_servers(root)[1].url, "https://example.com/mcp")
+            self.assertEqual(all_mcp_servers(root)[1].auth_env, "TEST_MCP_TOKEN")
 
     async def test_builtin_docs_can_be_disabled_without_connecting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -412,6 +530,9 @@ class MCPSetupTests(unittest.IsolatedAsyncioTestCase):
                 tools = await _load_configured_mcp_tools(lambda warning: self.fail(warning))
             self.assertEqual(seen, ["https://example.com/mcp"])
             self.assertEqual(tools[0].metadata["wallace_mcp"]["keywords"], ("drive", "files"))
+            with patch("tools.APP_ROOT", root):
+                listed = json.loads(list_mcp_connections.invoke({}))
+            self.assertEqual(listed["servers"][1]["tools"], ["list_files"])
 
     async def test_async_middleware_filters_tools_before_model_call(self):
         class Request:

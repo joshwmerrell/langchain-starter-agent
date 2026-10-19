@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parent
 TUI_SCRIPT = ROOT / "tui_agent.py"
 STATUS_PATH = ROOT / ".wallace" / "reload_status"
 MCP_CONFIG_PATH = ROOT / ".wallace" / "mcp_servers.json"
+ETHICS_MANIFESTO_PATH = ROOT / "ethics_manifesto.md"
 IDLE_SETTLE_SECONDS = 0.75
 WATCH_SKIP_DIRS = {".git", ".wallace", ".venv", "venv", "node_modules", "__pycache__", "workspace"}
 
@@ -175,6 +176,21 @@ def _config_change(changes: set[tuple[Change, str]]) -> bool:
     return changed and not tui_applied_current_config(ROOT)
 
 
+def _manifesto_change(changes: set[tuple[Change, str]]) -> bool:
+    return any(Path(path).resolve() == ETHICS_MANIFESTO_PATH for _, path in changes)
+
+
+def _manifesto_valid() -> bool:
+    from main import ethics_manifesto_prompt
+
+    try:
+        ethics_manifesto_prompt(ROOT)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"Ethics manifesto is not reloadable yet: {error}", flush=True)
+        return False
+    return True
+
+
 def _wait_for_idle(child: subprocess.Popen) -> bool:
     """Wait for a stable idle state before stopping the child."""
     idle_since: float | None = None
@@ -206,11 +222,12 @@ def main() -> int:
                 )
                 crash_reported = True
             config_changed = _config_change(changes)
-            if not config_changed and not any(_python_change(change) for change in changes):
+            manifesto_changed = _manifesto_change(changes)
+            if not config_changed and not manifesto_changed and not any(_python_change(change) for change in changes):
                 continue
 
             python_paths = _changed_python_paths(changes)
-            if not python_paths and not config_changed:
+            if not python_paths and not config_changed and not manifesto_changed:
                 continue
 
             if child.poll() is None and _is_busy():
@@ -225,6 +242,8 @@ def main() -> int:
             if not _changes_compile(python_paths):
                 continue
             if not _changes_smoke():
+                continue
+            if manifesto_changed and not _manifesto_valid():
                 continue
 
             if config_changed:

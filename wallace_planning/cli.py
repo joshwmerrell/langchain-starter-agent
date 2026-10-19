@@ -20,7 +20,26 @@ _INTENTS = (
     ("test", ("test", "verify", "validate")),
     ("research", ("research", "look up", "compare")),
 )
+_DECISION_REQUEST_RE = re.compile(
+    r"\b(?:determine|decide|recommend|prioriti[sz]e|identify)\s+"
+    r"(?:what|which|whether)\b|\bwhat\s+should\b",
+    re.I,
+)
+_DECISION_THEN_ACT_RE = re.compile(
+    r"\b(?:then|afterwards|after that|go ahead and)\s+"
+    r"(?:implement|build|develop|create|add|fix|change|edit)\b",
+    re.I,
+)
 _CONTINUE_RE = re.compile(r"^(?:please\s+)?(?:continue|resume|proceed|finish)(?:\b|$)", re.I)
+_AFFIRMATIVE_OFFER_RE = re.compile(
+    r"^(?:yes|yeah|sure|okay|ok)(?:[,\s]+(?:please\s+)?(?:proceed|go ahead|do it))?[.!\s]*$"
+    r"|^(?:please\s+)?(?:go ahead|do it)[.!\s]*$",
+    re.I,
+)
+_ASSISTANT_OFFER_RE = re.compile(
+    r"(?:Would you like me to|Shall I|Should I)\s+([^?\n]{4,350})\?\s*$",
+    re.I,
+)
 _RETRY_RE = re.compile(r"^(?:please\s+)?(?:try\s+again|retry(?:\s+that)?)[.!?\s]*$", re.I)
 _VERIFY_FOLLOWUP_RE = re.compile(
     r"^(?:please\s+)?(?:verify|check|confirm)\s+(?:its|that|the)\s+"
@@ -33,18 +52,33 @@ _EXPLICIT_RESUME_RE = re.compile(
     r"(?:plan|task|work|implementation)\b",
     re.I,
 )
-_FEATURE_LIST_RE = re.compile(
-    r"\b(?:pipeline|features?|requirements?|capabilities|tasks?)\s*:\s*([^\n.]+)",
-    re.I,
-)
 _CODE_CHECK_RE = re.compile(
-    r"\b(?:code|source|files?|website|site|app|scripts?|program|build|syntax)\b"
+    r"\b(?:code|source|files?|website|site|app|scripts?|program|build|syntax|tools?)\b"
     r"|\b[A-Za-z0-9_.-]+\.(?:py|js|mjs|ts|tsx|html|css|sh|go|rs)\b",
     re.I,
 )
 _DELETION_RE = re.compile(
     r"\b(?:delete|deleting|remove|removing|erase|purge)\b.{0,120}"
     r"\b(?:files?|site|directory|folder|assets?|pages?)\b",
+    re.I | re.S,
+)
+_CAPABILITY_QUESTION_RE = re.compile(
+    r"\b(?:does|do|is|are)\b[^?\n]{0,120}\b(?:exist|supported|available)\b",
+    re.I,
+)
+_EXPLICIT_ACTION_RE = re.compile(
+    r"\b(?:please\s+)?(?:add|implement|fix|create|build|change|update)\b",
+    re.I,
+)
+_REPORTED_OUTPUT_RE = re.compile(
+    r"\b(?:here is|here's) the output\s*:|"
+    r"\b(?:following|this) (?:error|output|response|log)\s*:|"
+    r"\b(?:error|output) response\s*:",
+    re.I,
+)
+_DIAGNOSE_BEFORE_CHANGE_RE = re.compile(
+    r"\b(?:come (?:back )?to me|report (?:back )?to me|ask me|check with me)\b"
+    r".{0,100}\bbefore\b.{0,60}\b(?:fix|fixing|implement|implementing|edit|editing|change|changing)\b",
     re.I | re.S,
 )
 
@@ -75,6 +109,49 @@ def continuation_instruction(request: str, messages: list[dict[str, str]]) -> st
     return request
 
 
+def accepted_offer_instruction(request: str, messages: list[dict[str, str]]) -> str:
+    """Ground a terse assent in the immediately preceding assistant offer only."""
+    prior = list(messages)
+    if prior and prior[-1] == {"role": "user", "content": request}:
+        prior.pop()
+    if not _AFFIRMATIVE_OFFER_RE.fullmatch(request.strip()):
+        # A failed literal tool call is not a completed turn. A subsequent
+        # "continue" should recover the offer the user had just accepted.
+        if not (
+            len(request) <= 100
+            and _requests_continuation(request)
+            and len(prior) >= 3
+            and prior[-1].get("role") == "assistant"
+            and re.search(r"</?tool_call(?:\s|>)", prior[-1].get("content", ""), re.I)
+            and prior[-2].get("role") == "user"
+            and _AFFIRMATIVE_OFFER_RE.fullmatch(prior[-2].get("content", "").strip())
+        ):
+            return request
+        prior = prior[:-2]
+    if not prior or prior[-1].get("role") != "assistant":
+        return request
+    answer = prior[-1].get("content", "")
+    if not isinstance(answer, str):
+        return request
+    offer = _ASSISTANT_OFFER_RE.search(answer.strip())
+    if not offer:
+        return request
+    action = offer.group(1).strip()
+    instruction = (
+        f"The user accepted your immediately preceding offer to {action}. "
+        "Carry out that offered next step now; do not repeat already completed work."
+    )
+    # This is a candidate from the previous reply, not proof of its README or
+    # installation instructions. It is enough to move from discovery to setup.
+    repositories = re.findall(r"https://github\.com/[\w.-]+/[\w.-]+", answer)
+    if repositories:
+        instruction += (
+            f" Previously identified GitHub repository: {repositories[-1]}. "
+            "Verify its setup instructions with an actual tool result before configuring it."
+        )
+    return instruction
+
+
 def _no_op_retry_plan(plan: PlanSpec) -> bool:
     """Legacy one-step retry records are not the task being retried."""
     return bool(
@@ -85,38 +162,12 @@ def _no_op_retry_plan(plan: PlanSpec) -> bool:
     )
 
 
-def _feature_requirements(request: str) -> list[str]:
-    """Extract an explicit, comma-separated scope list without inventing features."""
-    match = _FEATURE_LIST_RE.search(request)
-    if not match:
-        return []
-    items = [
-        re.sub(r"^(?:and|or)\s+", "", item.strip(), flags=re.I).strip()
-        for item in match.group(1).split(",")
-    ]
-    items = [item for item in items if 3 <= len(item) <= 100]
-    return items if 2 <= len(items) <= 8 else []
-
-
 def _implementation_steps(request: str, sources: list[SourceRef]) -> list[PlanStep]:
-    features = _feature_requirements(request)
-    implementation = [
-        PlanStep(
-            "",
-            item[0].upper() + item[1:] if re.match(r"^(?:implement|add|build|fix)\b", item, re.I)
-            else f"Implement {item}",
-            f"Implement and verify {item} within the scope of the original request.",
-            sources=sources,
-            expected_output=f"Working {item}, or a precise blocker and remaining work.",
-        )
-        for item in features
-    ] or [
-        PlanStep("", "Implement the requested work", "Apply the smallest coherent change using the existing approved tool flow.", sources=sources, expected_output="The requested behavior or artifact is implemented."),
-    ]
+    """Track observable work without fabricating feature-level proof."""
     steps = [
         PlanStep("", "Inspect relevant context", "Read referenced files and inspect the current project state.", sources=sources, expected_output="A bounded understanding of the affected files."),
-        *implementation,
-        PlanStep("", "Validate the result", "Run the narrowest relevant syntax or test checks and record their bounded output.", expected_output="Validation results and any recoverable failure."),
+        PlanStep("", "Apply requested changes", "Make the requested changes and record affected files. The original request defines the scope.", sources=sources, expected_output="Observed edits, without inferring that each requested feature is proven."),
+        PlanStep("", "Validate the result", "Run checks that cover the changed files; distinguish source checks from behavioral tests.", expected_output="Passing checks with their actual scope, or remaining failures."),
         PlanStep("", "Summarize and hand off", "Explain what changed, what was verified, and any remaining work.", expected_output="A concise user-facing summary."),
     ]
     for number, step in enumerate(steps, 1):
@@ -124,36 +175,80 @@ def _implementation_steps(request: str, sources: list[SourceRef]) -> list[PlanSt
     return steps
 
 
+def _review_steps(sources: list[SourceRef]) -> list[PlanStep]:
+    return [
+        PlanStep("step-01", "Inspect relevant context", "Read the relevant files or run the relevant checks.", sources=sources),
+        PlanStep("step-02", "Summarize and hand off", "Answer with findings and any limitations."),
+    ]
+
+
 def _upgrade_generic_plan(project_root: Path, plan: PlanSpec) -> PlanSpec:
-    """Give an unedited legacy plan its explicit feature checklist on resume."""
+    """Replace legacy heuristic feature counters with observed work stages."""
     if (
         plan.status != "active"
         or plan.intent not in {"implement", "fix", "refactor"}
-        or len(plan.steps) != 4
-        or plan.steps[1].title != "Implement the requested work"
-        or any(item.get("ok") and item.get("name") in {"write_safe_file", "replace_in_file", "edit_file_lines"} for item in plan.tool_history)
-        or len(_feature_requirements(plan.request)) < 2
+        or len(plan.steps) < 4
+        or (len(plan.steps) == 4 and plan.steps[1].title != "Implement the requested work")
     ):
         return plan
     replacement = _implementation_steps(plan.request, plan.sources)
-    plan.steps = [plan.steps[0], *replacement[1:-2], *plan.steps[-2:]]
+    plan.steps = [plan.steps[0], replacement[1], *plan.steps[-2:]]
     for number, step in enumerate(plan.steps, 1):
         step.id = f"step-{number:02d}"
-    plan.refresh_status()
+    plan.record_progress([])
     save_plan(project_root, plan)
     return plan
 
 
 def _intent(request: str) -> str:
-    lowered = request.lower()
-    if _DELETION_RE.search(request):
+    # Pasted command output often contains action words (e.g. `/mcp add`).
+    # Classify the user's instruction, not the help text in reported output.
+    reported_output = _REPORTED_OUTPUT_RE.search(request)
+    user_text = request[:reported_output.start()] if reported_output else request
+    lowered = user_text.lower()
+    question = _CAPABILITY_QUESTION_RE.search(user_text)
+    if (question
+            and not _EXPLICIT_ACTION_RE.search(user_text[:question.start()])
+            and not _EXPLICIT_ACTION_RE.search(user_text[question.end():])):
+        return "review"
+    if _DIAGNOSE_BEFORE_CHANGE_RE.search(user_text):
+        return "review"
+    if _DELETION_RE.search(user_text):
         return "delete"
-    if re.search(r"\b(?:tell me|what is)\b", lowered) and _CODE_CHECK_RE.search(request):
+    # The verbs may name candidate work, not authorize that work. A roadmap
+    # decision should produce a recommendation unless execution is explicit.
+    if is_decision_request(user_text):
+        return "review"
+    if re.search(r"\b(?:tell me|what is)\b", lowered) and _CODE_CHECK_RE.search(user_text):
+        return "review"
+    if (
+        reported_output
+        and re.search(r"\b(?:error|failed|failure|unavailable|not connected)\b", user_text + reported_output.group(), re.I)
+        and not _EXPLICIT_ACTION_RE.search(user_text)
+    ):
         return "review"
     for name, words in _INTENTS:
-        if any(re.search(rf"\b{re.escape(word)}\b", lowered) for word in words):
+        if any(re.search(rf"\b{re.escape(word)}\b(?!\s*\()", lowered) for word in words):
             return name
     return "general task"
+
+
+def is_decision_request(request: str) -> bool:
+    """Whether action words refer to a choice, rather than an edit request."""
+    reported_output = _REPORTED_OUTPUT_RE.search(request)
+    user_text = request[:reported_output.start()] if reported_output else request
+    if _DIAGNOSE_BEFORE_CHANGE_RE.search(user_text):
+        return True
+    if (
+        reported_output
+        and re.search(r"\b(?:error|failed|failure|unavailable|not connected)\b", user_text + reported_output.group(), re.I)
+        and not _EXPLICIT_ACTION_RE.search(user_text)
+    ):
+        return True
+    return bool(
+        _DECISION_REQUEST_RE.search(request)
+        and not _DECISION_THEN_ACT_RE.search(request)
+    )
 
 
 def _safe_sources(project_root: Path, request: str) -> list[SourceRef]:
@@ -200,10 +295,7 @@ def parse_request(project_root: Path, request: str, *, session_id: str | None = 
             PlanStep("step-03", "Summarize and hand off", "Report observed results and any remaining limitations."),
         ]
     elif intent in {"review", "research", "test"}:
-        steps = [
-            PlanStep("step-01", "Inspect relevant context", "Read the relevant files or run the relevant checks.", sources=sources),
-            PlanStep("step-02", "Summarize and hand off", "Answer with findings and any limitations."),
-        ]
+        steps = _review_steps(sources)
     else:
         steps = [PlanStep("step-01", "Respond to the request", "Answer clearly and state any limitation.")]
     return create_plan(
@@ -213,7 +305,11 @@ def parse_request(project_root: Path, request: str, *, session_id: str | None = 
         constraints=constraints,
         sources=sources,
         steps=steps,
-        expected_outputs=["Implemented change", "Validation result", "Concise summary"],
+        expected_outputs=(
+            ["Observed changes", "Scoped check results", "Summary and limitations"]
+            if intent in {"implement", "fix", "refactor", "delete"}
+            else ["Evidence-backed response", "Limitations and remaining work"]
+        ),
         session_id=session_id,
     )
 
@@ -227,8 +323,8 @@ def planning_context(
     next_text = f"Next step: {pending.id} — {pending.title}." if pending else "All recorded steps are complete."
     checkpoint_lines = []
     for step in plan.steps:
-        if step.status == "complete" and step.result:
-            checkpoint_lines.append(f"- {step.id}: {bounded(step.result, 300)}")
+        if step.status == "complete" and step.result and step is not plan.steps[-1]:
+            checkpoint_lines.append(f"- {step.id}: {bounded(step.result, 200)}")
     checkpoint = "\n".join(checkpoint_lines[-4:]) or "- No completed checkpoints yet."
     sources = ", ".join(f"`{source.path}`" for source in plan.sources[:8]) or "none recorded"
     tool_section = "\n".join(
@@ -241,6 +337,13 @@ def planning_context(
     unchecked_section = (
         "Files still needing matching checks: " + ", ".join(unchecked[:8]) + "\n"
         if unchecked else ""
+    )
+    if plan.edit_evidence.get("unscoped_mutations"):
+        unchecked_section += "A command or external tool changed unknown files; reconcile its effects before claiming completion.\n"
+    verification_note = plan.verification_note()
+    tool_assessment_section = (
+        "Tool execution assessment: " + plan.execution_assessment() + "\n"
+        if re.search(r"\btools?\b", plan.request, re.IGNORECASE) else ""
     )
     remaining = "\n".join(
         f"- {step.id}: {bounded(step.title, 100)}"
@@ -289,9 +392,10 @@ def planning_context(
             "complete the pending step. Do not repeat its preamble; proceed with "
             "the next concrete action.\n"
         )
+    check_limits = f"Check limits: {verification_note}\n" if verification_note else ""
     return (
-        "Use this durable execution plan as the compact working memory for the "
-        "current request. Do not repeat completed work.\n"
+        "Complete the full user request in this turn. Stages are checkpoints, "
+        "not stopping points. Reuse completed work.\n"
         f"{instruction_section}"
         f"Plan: {plan.plan_id} ({completed}/{len(plan.steps)} complete)\n"
         f"Original request: {bounded(plan.request, 600)}\n"
@@ -305,6 +409,8 @@ def planning_context(
         "unchanged failed commands):\n"
         f"{tool_section}\n"
         f"{unchecked_section}"
+        f"{check_limits}"
+        f"{tool_assessment_section}"
         f"{failures_section}"
         f"{error_section}"
         f"{deletion_section}"
@@ -366,6 +472,23 @@ def resume_or_create(project_root: Path, request: str, *, session_id: str | None
 
 def _prepare_resumed_plan(project_root: Path, plan: PlanSpec) -> PlanSpec:
     """Drop historical tool-invocation typos, not genuine failed checks."""
+    if (
+        plan.status == "active"
+        and plan.intent in {"implement", "fix", "refactor"}
+        and _intent(plan.request) == "review"
+        and not plan.edit_evidence.get("targets")
+        and not any(
+            item.get("ok") and item.get("name") in {"write_safe_file", "replace_in_file", "edit_file_lines"}
+            for item in plan.tool_history
+        )
+    ):
+        plan.intent = "review"
+        plan.steps = _review_steps(plan.sources)
+        plan.expected_outputs = ["Evidence-backed findings", "Recommendation and next step"]
+        plan.summary = ""
+        plan.last_error = ""
+        plan.record_progress([])
+        save_plan(project_root, plan)
     plan = _upgrade_generic_plan(project_root, plan)
     invalid = [
         item for item in plan.unresolved_failures

@@ -231,6 +231,15 @@ class CoreSafetyTests(unittest.TestCase):
         self.assertNotIn(line, issue)
         self.assertIsNone(response_quality_error("I inspected main.py and found the issue."))
 
+    def test_literal_tool_call_is_not_accepted_as_completed_work(self):
+        fake = '<tool_call>{"name":"search_repositories","arguments":{"query":"weather-mcp"}}</tool_call>'
+        self.assertIn("instead of invoking a tool", response_quality_error(
+            fake, current_request="Connect the weather MCP server."
+        ))
+        self.assertIsNone(response_quality_error(
+            fake, current_request="Show me a literal example of a tool_call tag."
+        ))
+
     def test_copied_prior_reply_and_single_line_word_salad_are_rejected(self):
         previous = (
             "I'm Wallace, your all-around assistant. Here are my capabilities: "

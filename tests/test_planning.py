@@ -10,6 +10,7 @@ from wallace_planning import (
     PlanExecutor,
     PlanStep,
     SourceRef,
+    accepted_offer_instruction,
     continuation_instruction,
     create_plan,
     load_plan,
@@ -20,6 +21,201 @@ from wallace_planning import (
 
 
 class PlanningTests(unittest.TestCase):
+    def test_yes_proceed_accepts_latest_offer_instead_of_repeating_search(self):
+        request = "Yes, proceed."
+        history = [
+            {"role": "user", "content": "Find the weather-mcp repository on GitHub."},
+            {"role": "assistant", "content": (
+                "Found https://github.com/ezh0v/weather-mcp. "
+                "Would you like me to help set it up as an MCP connection in your TUI?"
+            )},
+            {"role": "user", "content": request},
+        ]
+        effective = accepted_offer_instruction(request, history)
+        self.assertIn("set it up as an MCP connection", effective)
+        self.assertIn("https://github.com/ezh0v/weather-mcp", effective)
+        self.assertIn("Verify its setup instructions", effective)
+        self.assertNotIn("Find the weather-mcp repository", effective)
+        with tempfile.TemporaryDirectory() as directory:
+            plan = resume_or_create(Path(directory), effective, session_id="dev")
+            self.assertEqual(plan.request, effective)
+            self.assertNotEqual(plan.request, request)
+
+        failed_reply = (
+            '<tool_call>{"name":"search_repositories","arguments":{"query":"weather-mcp"}}'
+            '</tool_call>'
+        )
+        continued = accepted_offer_instruction("Continue.", [
+            *history,
+            {"role": "assistant", "content": failed_reply},
+            {"role": "user", "content": "Continue."},
+        ])
+        self.assertIn("set it up as an MCP connection", continued)
+        self.assertNotIn("search_repositories", continued)
+
+    def test_affirmative_without_single_recent_offer_is_not_resolved(self):
+        self.assertEqual(accepted_offer_instruction("Yes, proceed.", []), "Yes, proceed.")
+        self.assertEqual(accepted_offer_instruction("Yes, proceed.", [
+            {"role": "assistant", "content": "Would you like A or B?"},
+            {"role": "user", "content": "Yes, proceed."},
+        ]), "Yes, proceed.")
+        self.assertEqual(accepted_offer_instruction("Yes, proceed with the tests.", [
+            {"role": "assistant", "content": "Would you like me to delete the files?"},
+        ]), "Yes, proceed with the tests.")
+
+    def test_reported_mcp_error_is_not_a_request_to_add_or_remove(self):
+        from main import verified_plan_response
+        from wallace_planning import save_plan
+
+        request = (
+            "It tried running '/mcp connect github', but you responded with the following error: "
+            "MCP github is still not connected after retry. See /mcp for diagnostics. "
+            "Use /mcp add <name> <URL> or /mcp on|off|toggle|remove|connect <name>."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, request, session_id="dev")
+            self.assertEqual(plan.intent, "review")
+            self.assertEqual(verified_plan_response(plan, "The connection failed during discovery.", [{
+                "id": "mcp", "name": "list_mcp_connections", "target": "",
+                "outcome": "ok", "ok": True,
+            }]), "The connection failed during discovery.")
+            legacy = parse_request(root, "Implement a feature", session_id="legacy")
+            legacy.request = request
+            save_plan(root, legacy)
+            self.assertEqual(resume_or_create(root, request, session_id="legacy").intent, "review")
+
+    def test_diagnose_and_consult_before_fixing_is_read_only(self):
+        request = (
+            "Diagnose the get_git_status tool issue. Find out why it didn't work "
+            "and figure out a way to fix it. Come to me first before fixing it next."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(parse_request(Path(directory), request).intent, "review")
+
+    def test_pasted_mcp_help_does_not_turn_command_question_into_edit(self):
+        request = (
+            "I think the command doesn't exist. Does the connect option for /mcp exist? "
+            "Here is the output: Thread command failed: use /mcp [list], "
+            "/mcp add <name> <URL> [keywords...], /mcp remove <name>"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, request, session_id="development")
+            self.assertEqual(plan.intent, "review")
+            self.assertEqual(len(plan.steps), 2)
+            self.assertEqual(
+                parse_request(root, "Does /mcp connect exist? Please add it.").intent,
+                "implement",
+            )
+            from wallace_planning import save_plan
+            legacy = parse_request(root, "Implement a feature", session_id="old")
+            legacy.request = request
+            legacy.record_progress([{
+                "id": "mcp", "name": "list_mcp_connections", "target": "",
+                "outcome": "ok", "ok": True,
+            }])
+            save_plan(root, legacy)
+            resumed = resume_or_create(root, request, session_id="old")
+            self.assertEqual(resumed.intent, "review")
+
+    def test_roadmap_decision_is_review_not_implementation(self):
+        from main import verified_plan_response
+
+        request = (
+            "I would like to look at wallace's roadmap and determine what to "
+            "develop, build, and implement from there."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, request, session_id="work")
+            self.assertEqual(plan.intent, "review")
+            self.assertEqual(len(plan.steps), 2)
+            answer = verified_plan_response(plan, "The next priority is tool orchestration.", [{
+                "id": "roadmap", "name": "read_safe_file", "target": "wallace_roadmap.md",
+                "outcome": "ok", "ok": True,
+            }])
+            self.assertEqual(answer, "The next priority is tool orchestration.")
+            self.assertEqual(plan.status, "complete")
+            self.assertEqual(
+                parse_request(root, "Review the roadmap, then implement its next step.").intent,
+                "implement",
+            )
+
+    def test_resuming_misclassified_roadmap_plan_repairs_it(self):
+        from main import verified_plan_response
+        from wallace_planning import save_plan
+
+        request = (
+            "I would like to look at wallace's roadmap and determine what to "
+            "develop, build, and implement from there."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Implement a feature", session_id="work")
+            plan.request = request
+            plan.record_progress([{
+                "id": "read", "name": "read_safe_file", "target": "wallace_roadmap.md",
+                "outcome": "ok", "ok": True,
+            }], response="No successful file edit was verified.")
+            save_plan(root, plan)
+            resumed = resume_or_create(root, request, session_id="work")
+            self.assertEqual(resumed.plan_id, plan.plan_id)
+            self.assertEqual(resumed.intent, "review")
+            self.assertEqual(len(resumed.steps), 2)
+            self.assertEqual(resumed.steps[0].status, "complete")
+            self.assertEqual(resumed.summary, "")
+            self.assertEqual(
+                verified_plan_response(resumed, "I recommend the next roadmap milestone.", []),
+                "I recommend the next roadmap milestone.",
+            )
+
+    def test_tool_work_needs_matching_contract_after_latest_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = parse_request(root, "Fix get_git_status tool in git_tools.py", session_id="work")
+            plan.record_progress([
+                {"id": "read", "name": "read_safe_file", "target": "git_tools.py", "outcome": "ok", "ok": True},
+                {"id": "edit", "name": "replace_in_file", "target": "git_tools.py", "outcome": "ok", "ok": True},
+                {"id": "test", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
+            ], response="Fixed the tool.")
+            self.assertEqual(plan.status, "active")
+            self.assertIn("Agent execution gap", plan.execution_assessment())
+            plan.record_progress([{
+                "id": "wrong", "name": "verify_tool_contract", "target": "other_tool",
+                "test_path": "tests/test_other_tool.py", "outcome": "ok", "ok": True,
+            }], response="Verified the tool.")
+            self.assertEqual(plan.status, "active")
+            plan.record_progress([{
+                "id": "contract", "name": "verify_tool_contract", "target": "get_git_status",
+                "test_path": "tests/test_git_tools.py", "outcome": "ok", "ok": True,
+            }], response="Verified the tool.")
+            self.assertEqual(plan.status, "complete")
+            from wallace_planning import save_plan
+            save_plan(root, plan)
+            restored = load_plan(root, "work", plan.plan_id)
+            self.assertEqual(restored.edit_evidence["contract"]["tool_name"], "get_git_status")
+            restored.record_progress([{
+                "id": "edit-again", "name": "replace_in_file", "target": "git_tools.py",
+                "outcome": "ok", "ok": True,
+            }], response="Adjusted the tool.")
+            self.assertEqual(restored.status, "active")
+
+    def test_tool_failure_assessment_does_not_guess_root_cause(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = parse_request(Path(directory), "Diagnose why my tool fails")
+            plan.record_progress([{
+                "id": "call", "name": "execute_command", "target": "git status",
+                "outcome": "Exit code: 128", "ok": False,
+            }])
+            self.assertIn("Invocation", plan.execution_assessment())
+            self.assertIn("before calling the tool implementation faulty", planning_context(plan))
+            plan.record_progress([{
+                "id": "contract", "name": "verify_tool_contract", "target": "my_tool",
+                "outcome": "failed", "ok": False,
+            }])
+            self.assertIn("Verification failed", plan.execution_assessment())
+
     def test_diagnose_requests_require_inspection_step(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = parse_request(Path(directory), "Diagnose why get_git_status returned nothing / errored.")
@@ -407,7 +603,7 @@ class PlanningTests(unittest.TestCase):
             negated = resume_or_create(root, "Do not resume the latest active plan; review tools.py", session_id="work")
             self.assertNotEqual(negated.plan_id, unrelated.plan_id)
 
-    def test_feature_list_creates_concrete_steps_without_private_path_in_prompt(self):
+    def test_feature_scope_stays_in_request_without_invented_feature_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             request = (
                 "Implement the Python-to-JavaScript pipeline: detection from extensions and contents, "
@@ -415,19 +611,14 @@ class PlanningTests(unittest.TestCase):
             )
             plan = parse_request(Path(directory), request, session_id="work")
             titles = [step.title for step in plan.steps]
-            self.assertEqual(titles[1:-2], [
-                "Implement detection from extensions and contents",
-                "Implement translation",
-                "Implement ESLint warnings",
-                "Implement strict type-checking",
-                "Implement structural AST comparison",
-            ])
+            self.assertEqual(titles[1:-2], ["Apply requested changes"])
             context = planning_context(plan)
-            self.assertIn("Implement strict type-checking", context)
+            self.assertIn("strict type-checking", context)
+            self.assertIn("checkpoints, not stopping points", context)
             self.assertNotIn("Plan artifact:", context)
             self.assertNotIn(".wallace/plans/sessions/", context)
 
-    def test_unedited_legacy_plan_is_upgraded_on_resume(self):
+    def test_legacy_generic_plan_keeps_observed_stages_on_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             request = "Implement the pipeline: detect language, translate source, validate output."
@@ -441,12 +632,12 @@ class PlanningTests(unittest.TestCase):
             )
             upgraded = resume_or_create(root, "Please resume the latest active plan", session_id="work")
             self.assertEqual(upgraded.plan_id, plan.plan_id)
-            self.assertEqual(len(upgraded.steps), 6)
+            self.assertEqual(len(upgraded.steps), 4)
             self.assertEqual(upgraded.steps[0].result, "Read main.py")
-            self.assertEqual(upgraded.steps[1].title, "Implement detect language")
-            self.assertEqual(load_plan(root, "work", plan.plan_id).steps[1].title, "Implement detect language")
+            self.assertEqual(upgraded.steps[1].title, "Apply requested changes")
+            self.assertEqual(load_plan(root, "work", plan.plan_id).steps[1].title, "Apply requested changes")
 
-    def test_one_edit_cannot_complete_multiple_feature_steps(self):
+    def test_observed_work_does_not_use_edit_counts_as_feature_proof(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = parse_request(Path(directory), "Implement the pipeline: detect language, translate source, validate output")
             plan.record_progress([
@@ -454,15 +645,16 @@ class PlanningTests(unittest.TestCase):
                 {"id": "edit-1", "name": "replace_in_file", "target": "main.py", "outcome": "ok", "ok": True},
                 {"id": "test-1", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
             ], response="Implemented and tested language detection.")
-            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete", "pending", "pending"])
-            self.assertEqual(plan.steps[-2].status, "pending")
+            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete"])
+            self.assertIn("Successful file edits recorded", plan.steps[1].result)
+            self.assertEqual(plan.steps[-2].status, "complete")
             plan.record_progress([], response="I am still working.")
-            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete", "pending", "pending"])
+            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete"])
             plan.record_progress([
                 {"id": "edit-2", "name": "replace_in_file", "target": "translator.py", "outcome": "ok", "ok": True},
                 {"id": "test-2", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
             ], response="Implemented and tested translation.")
-            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete", "complete", "pending"])
+            self.assertEqual([step.status for step in plan.steps[1:-2]], ["complete"])
             plan.record_progress([
                 {"id": "edit-3", "name": "replace_in_file", "target": "validator.py", "outcome": "ok", "ok": True},
                 {"id": "test-3", "name": "run_tests", "target": "tests", "outcome": "ok", "ok": True},
@@ -539,7 +731,7 @@ class PlanningTests(unittest.TestCase):
                 "outcome": "Exit code: 0", "ok": True,
             }], response="Partial handoff after malformed tool call.", error="malformed tool call")
             self.assertEqual(plan.status, "active")
-            self.assertEqual(plan.steps[1].status, "pending")
+            self.assertEqual(plan.steps[1].status, "complete")
             plan.record_progress([], response="Edited and tested main.py.")
             self.assertEqual(plan.status, "complete")
             self.assertIn("replace_in_file main.py", planning_context(plan))
@@ -619,7 +811,8 @@ class PlanningTests(unittest.TestCase):
                 "id": "check", "name": "check_source_file", "target": "test_site/styles.css",
                 "outcome": "ok", "ok": True,
             }])
-            self.assertEqual(verified, "CSS checked.")
+            self.assertTrue(verified.startswith("CSS checked.\n\n"))
+            self.assertIn("functional behavior was not tested", verified)
             self.assertEqual(plan.status, "complete")
 
     def test_plan_context_does_not_repeat_unverified_assistant_summary(self):
@@ -747,7 +940,8 @@ class PlanningTests(unittest.TestCase):
                 "id": "check-js", "name": "check_source_file", "target": "site/app.js",
                 "outcome": "Exit code: 0", "ok": True,
             }])
-            self.assertEqual(result, "Done")
+            self.assertTrue(result.startswith("Done\n\n"))
+            self.assertIn("functional behavior was not tested", result)
             self.assertEqual(restored.status, "complete")
 
     def test_failed_edit_and_check_require_actual_recovery(self):

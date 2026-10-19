@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -16,6 +17,31 @@ from pydantic import SecretStr
 _MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:-]{0,199}\Z")
 CLOUD_PROVIDERS = {"openai", "gemini"}
 CLOUD_KEY_VARIABLES = {"openai": "OPENAI_API_KEY", "gemini": "GOOGLE_API_KEY"}
+
+
+@lru_cache(maxsize=32)
+def _ollama_thinking_supported(base_url: str, model: str) -> bool:
+    """Probe model metadata once; offline/unrecognized models keep their default."""
+    try:
+        response = httpx.post(
+            base_url.rstrip("/") + "/api/show", json={"model": model}, timeout=2,
+        )
+        response.raise_for_status()
+        return "thinking" in response.json().get("capabilities", [])
+    except (httpx.HTTPError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def ollama_reasoning(base_url: str, model: str) -> bool | None:
+    """Keep supported reasoning separate from final text without changing models."""
+    setting = os.getenv("WALLACE_REASONING", "auto").strip().lower()
+    if setting in {"true", "1", "on"}:
+        return True
+    if setting in {"false", "0", "off"}:
+        return False
+    if setting == "auto" and _ollama_thinking_supported(base_url, model):
+        return True
+    return None
 
 
 class MissingCredentialError(ValueError):

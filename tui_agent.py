@@ -5,6 +5,7 @@ Keys:      Enter = send, Esc = cancel current request, Ctrl+L = clear log, Ctrl+
            Select chat text with the mouse and press Ctrl+C; Input supports Ctrl+C/Ctrl+V.
 Threads:   /threads, /new [--trust MODE] [title], /trust [MODE], /switch, /rename, /remove, /clear
 Editor:    F5 or /edit [relative path] opens a safe workspace file in Neovim/Vim
+Shell:     /run <command> executes a scoped, non-interactive command directly
 Themes:    F9 or /theme to choose; /theme <name> to apply directly
 Models:    F10 or /model to list; /model <name> to switch; /key opens masked entry
 MCP:       F11 or /mcp to list; /mcp add|remove|on|off|reload to manage
@@ -48,23 +49,23 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from langchain_core.messages import AIMessage
+
 from main import (
     CLOUD_KEY_WARNING,
     CLOUD_TOOL_WARNING,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
-    assistant_response_text,
     clean_response_retry_prompt,
-    ConversationStore,
     EMPTY_RESPONSE_RETRY_PROMPT,
+    MALFORMED_TOOL_CALL_RETRY_PROMPT,
     describe_error,
-    extract_action_requests,
+    direct_command_text,
     format_action_request,
     is_malformed_tool_call_error,
     local_datetime_response,
     list_models_for_provider,
     malformed_retry_payload,
-    make_decision,
     memory_budget_for,
     model_tool_activity,
     new_thread_config,
@@ -72,23 +73,26 @@ from main import (
     RepetitiveResponseError,
     recover_pending_full_suite,
     response_quality_error,
-    resume_command,
     setup_agent,
     summarize_thread_memory,
     with_thread_memory,
     verified_plan_response,
     tool_result_failed,
 )
+from wallace_execution import TurnRunner, pending_work_prompt
+from wallace_memory import bind_conversation, reset_conversation
 from tools import (
     SAFE_ROOT, SENSITIVE_PATTERNS, SKIP_DIRS,
-    reset_active_workspace, set_active_workspace,
+    execute_command_async, reset_active_workspace, set_active_workspace,
 )
 from wallace_runtime import APP_ROOT, DEV_MODE, ensure_workspace, plan_session_id, thread_workspace
 from wallace_keys import add_key, list_keys, parse_key_command, remove_key, set_key_active
 from wallace_mcp import (
     all_mcp_servers,
     apply_mcp_command,
+    connection_details,
     connection_status,
+    describe_mcp_server,
     parse_mcp_command,
     read_mcp_configuration,
     restore_connection_statuses,
@@ -108,6 +112,7 @@ from wallace_planning import (
     ArchiveManager,
     ConversationThreadManager,
     TRUST_MODES,
+    accepted_offer_instruction,
     continuation_instruction,
     parse_new_thread_arguments,
     planning_context,
@@ -865,7 +870,8 @@ class CloudKeyScreen(ModalScreen[str | None]):
         with Vertical(id="cloud_key_dialog"):
             yield Static(f"Enter {self.provider} API key", id="cloud_key_title")
             yield Static(
-                "Hidden input. Saved in the OS keyring; Esc cancels."
+                "First run /key add <name> <provider> (example: /key add work-openai openai), "
+                "then enter the actual key here. Hidden input; saved in the OS keyring; Esc cancels."
                 if self.save else
                 "Hidden input. This entry applies to the running session; Esc cancels.",
                 id="cloud_key_hint",
@@ -1137,7 +1143,7 @@ class AgentTUI(App):
         self._write_chat_block(
             f"Thread: {self.thread_id} · trust: {self.thread_manager.resolve(self.thread_id).trust_mode}. "
             + ("Workspace: Wallace source. " if self.workspace_root == APP_ROOT else "Workspace: workspace/. ") +
-            "/status /threads /new /switch /trust /edit /rename /remove /clear /theme /model /mcp /keys"
+            "/run /status /threads /new /switch /trust /edit /rename /remove /clear /theme /model /mcp /keys"
         )
         self._announce_trust_risk(self.thread_manager.resolve(self.thread_id).trust_mode)
         self._restore_conversation()
@@ -1324,10 +1330,18 @@ class AgentTUI(App):
             active = "active" if server.enabled else "inactive"
             self.chat_log.write(
                 f"  {server.name} [{kind}] — {active}, {connection_status(server)}\n"
-                f"    {server.url}"
+                f"    {describe_mcp_server(server)}"
             )
+            if server.auth_env:
+                self.chat_log.write(f"    Auth: host variable {server.auth_env}")
+            details = connection_details(server)
+            if details["detail"]:
+                self.chat_log.write(f"    {details['detail']}")
+            if details["tools"]:
+                self.chat_log.write(f"    Tools: {', '.join(details['tools'])}")
         self.chat_log.write(
-            "Use /mcp add <name> <URL> [keywords...], /mcp on|off|remove <name>, "
+            "Use /mcp add <name> <URL> [keywords...] or /mcp add <name> --stdio <command> [args...]; "
+            "/mcp on|off|toggle|remove|connect <name>, /mcp auth <name> <ENV_NAME>, "
             "or /mcp reload. 'Connected' means the last discovery succeeded; "
             "active choices are saved across restarts."
         )
@@ -1345,7 +1359,7 @@ class AgentTUI(App):
             changed = apply_mcp_command(
                 APP_ROOT, operation, name, url, keywords, live_applied=True
             )
-            if not changed and operation != "reload":
+            if not changed and operation not in {"reload", "connect"}:
                 self.chat_log.write(f"MCP server {name} is already {operation}.")
                 return
             if self.agent is not None:
@@ -1355,9 +1369,17 @@ class AgentTUI(App):
                     credentials=self.credentials,
                 )
                 self.agent, self.thread_config = replacement_agent, replacement_config
+            if operation == "connect" and self.agent is not None:
+                target = next(server for server in all_mcp_servers(APP_ROOT) if server.name.casefold() == name.casefold())
+                if connection_status(target) != "connected":
+                    self._write_warning(f"MCP {name} is still not connected after retry. See /mcp for diagnostics.")
+                    self.action_show_mcp()
+                    return
             description = (
                 "MCP connections refreshed."
-                if operation == "reload" else f"MCP {operation} {name} saved."
+                if operation == "reload" else
+                f"MCP {name} connection refreshed."
+                if operation == "connect" else f"MCP {operation} {name} saved."
             )
             if self.agent is None:
                 description += " Connections will load when Wallace starts."
@@ -1489,7 +1511,9 @@ class AgentTUI(App):
                 )
                 self.chat_log.write(f"  {entry.name} [{entry.provider}, {entry.source}] — {status}")
             self.chat_log.write(
-                "Use /key add <name> <openai|gemini>, /key on|off|remove <name>. "
+                "To save a key: run /key add <name> <openai|gemini> (example: /key add work-openai openai), "
+                "then enter the secret in the masked prompt. Never put the secret in the command. "
+                "Use /key on|off|remove <name>. "
                 "Environment keys must be deleted from .env by you."
             )
         except (OSError, ValueError) as error:
@@ -1594,17 +1618,20 @@ class AgentTUI(App):
 
         self._set_busy(True)
         agent_prompt = prompt
+        effective_request = prompt
         self._active_plan = None
         try:
+            history = self.conversation_store.load_all()
+            effective_request = accepted_offer_instruction(prompt, history)
             self._active_plan = resume_or_create(
-                APP_ROOT, prompt, session_id=plan_session_id(self.thread_id, development=DEV_MODE)
+                APP_ROOT, effective_request, session_id=plan_session_id(self.thread_id, development=DEV_MODE)
             )
             agent_prompt = planning_context(
                 self._active_plan,
                 latest_instruction=continuation_instruction(
-                    prompt, self.conversation_store.load_all()
+                    effective_request, history
                 ),
-            ) + "\nUser request:\n" + prompt
+            ) + "\nUser request:\n" + effective_request
             self._write_chat_block(
                 Text(
                     f"Plan {self._active_plan.plan_id}: "
@@ -1646,6 +1673,7 @@ class AgentTUI(App):
         self.run_turn(
             agent_prompt,
             user_prompt=prompt,
+            task_prompt=effective_request,
             seed_messages=None,
         )
 
@@ -1657,17 +1685,16 @@ class AgentTUI(App):
         prompt: str,
         *,
         user_prompt: str | None = None,
+        task_prompt: str | None = None,
         seed_messages: list[dict[str, str]] | None = None,
     ) -> None:
         turn_messages = []
-        payload = {"messages": [*(seed_messages or []), {"role": "user", "content": prompt}]}
-        recovery_attempted = False
-        empty_response_retried = False
-        quality_retried = False
+        runner = None
         response = None
         self._shown_tool_calls: set[tuple] = set()
         self._shown_tool_results: set[tuple] = set()
         initial_prompt = prompt
+        conversation_token = bind_conversation(self.conversation_store)
         workspace_token = set_active_workspace(self.workspace_root)
         status_token = bind_status(self._status_context())
         try:
@@ -1689,118 +1716,56 @@ class AgentTUI(App):
                 except (OSError, ValueError) as error:
                     self._write_warning(f"Conversation memory unavailable: {error}")
                 initial_prompt = with_thread_memory(memory, prompt)
-                payload["messages"][-1]["content"] = initial_prompt
-            while True:
-                interrupts = []
-                try:
-                    async for update in self.agent.astream(
-                        payload, self.thread_config, stream_mode="updates"
-                    ):
-                        for key, output in update.items():
-                            if key == "__interrupt__":
-                                interrupts.extend(output)
-                                continue
-                            messages = output.get("messages") if isinstance(output, dict) else None
-                            if messages is None:
-                                continue
-                            if not isinstance(messages, (list, tuple)):
-                                messages = [messages]
-                            for msg in messages:
-                                turn_messages.append(msg)
-                                self.session_usage.record_message(msg, self.model_name)
-                                self._show_progress(msg)
-                except Exception as error:
-                    if not recovery_attempted and is_malformed_tool_call_error(error):
-                        recovery_attempted = True
-                        self._write_warning(
-                            "The model returned malformed tool-call JSON; "
-                            "recovering from the saved turn state."
-                        )
-                        payload = await malformed_retry_payload(
-                            self.agent, self.thread_config, initial_prompt
-                        )
-                        continue
-                    raise
+            def checkpoint(messages):
+                if self._active_plan is not None:
+                    calls = {
+                        call.get("id") for message in messages if isinstance(message, AIMessage)
+                        for call in message.tool_calls or []
+                    }
+                    activity = [item for item in model_tool_activity(messages) if item["id"] in calls]
+                    self._active_plan.record_progress(activity)
+                    save_plan(APP_ROOT, self._active_plan)
 
-                requests = extract_action_requests(interrupts)
-                if not requests:
-                    # The checkpoint includes tool results that a streamed
-                    # update can omit. Decide whether a final answer exists
-                    # before leaving the approval/recovery loop.
-                    response = assistant_response_text(turn_messages)
-                    try:
-                        state = await self.agent.aget_state(self.thread_config)
-                        stored_messages = state.values.get("messages", [])
-                        stored_response = assistant_response_text(stored_messages)
-                        if stored_response is not None:
-                            response = stored_response
-                        self.session_usage.record_messages(stored_messages, self.model_name)
-                        turn_messages.extend(stored_messages)
-                    except Exception:
-                        pass
-                    if response is None and not empty_response_retried:
-                        empty_response_retried = True
-                        self._write_warning(
-                            "The model returned no final text; continuing the "
-                            "unfinished turn once."
-                        )
-                        payload = {"messages": [
-                            {"role": "user", "content": EMPTY_RESPONSE_RETRY_PROMPT}
-                        ]}
-                        continue
-                    if response is not None and user_prompt is not None:
-                        previous_assistant = next(
-                            (
-                                item["content"] for item in reversed(self.conversation_store.load_all())
-                                if item["role"] == "assistant"
-                            ),
-                            None,
-                        )
-                        quality_error = response_quality_error(
-                            response,
-                            previous_assistant=previous_assistant,
-                            current_request=user_prompt,
-                        )
-                        if (
-                            quality_error is not None
-                            and not quality_retried
-                            and (self._active_plan is None or self._active_plan.intent == "general task")
-                            and not model_tool_activity(turn_messages)
-                        ):
-                            quality_retried = True
-                            self._write_warning(
-                                "The model echoed or looped; retrying the simple request "
-                                "once without prior replies."
-                            )
-                            self.thread_config = new_thread_config()
-                            payload = {"messages": [{
-                                "role": "user",
-                                "content": clean_response_retry_prompt(user_prompt),
-                            }]}
-                            turn_messages = []
-                            response = None
-                            recovery_attempted = False
-                            empty_response_retried = False
-                            continue
-                    break
-
-                # The agent paused for approval: ask, then resume the same run.
-                decisions = []
-                for request in requests:
-                    self._set_thinking_status(
-                        rotate=False,
-                        message="Waiting for your approval",
-                    )
-                    approved = await self._ask_approval(request)
-                    decisions.append(make_decision(approved))
-                    self.chat_log.write(
-                        Text("  ✓ approved", style=WALLACE_THEME["success"])
-                        if approved
-                        else Text("  ✗ rejected", style=WALLACE_THEME["error"])
-                    )
+            async def approve_step(request):
+                self._set_thinking_status(rotate=False, message="Waiting for your approval")
+                approved = await self._ask_approval(request)
+                self.chat_log.write(Text(
+                    "  ✓ approved" if approved else "  ✗ rejected",
+                    style=WALLACE_THEME["success" if approved else "error"],
+                ))
                 self._thinking_index = 0
                 self._set_thinking_status(rotate=True)
-                payload = resume_command(decisions)
+                return approved
+
+            previous_assistant = next((
+                item["content"] for item in reversed(self.conversation_store.load_all())
+                if item["role"] == "assistant"
+            ), None)
+            can_retry = user_prompt is not None and (
+                self._active_plan is None or self._active_plan.intent == "general task"
+            )
+            def continue_work(messages, response):
+                followup = pending_work_prompt(self._active_plan, messages, response)
+                if self._active_plan is not None:
+                    save_plan(APP_ROOT, self._active_plan)
+                return followup
+
+            runner = TurnRunner(
+                self.agent, self.thread_config, approve=approve_step,
+                malformed_retry=malformed_retry_payload, malformed_error=is_malformed_tool_call_error,
+                malformed_prompt=MALFORMED_TOOL_CALL_RETRY_PROMPT, empty_prompt=EMPTY_RESPONSE_RETRY_PROMPT,
+                on_message=self._show_progress, on_warning=self._write_warning,
+                checkpoint=checkpoint, usage=self.session_usage, model_name=self.model_name,
+                continue_work=continue_work,
+            )
+            result = await runner.run(
+                initial_prompt, seed_messages=seed_messages or (),
+                current_request=user_prompt or "", previous_assistant=previous_assistant,
+                clean_prompt=clean_response_retry_prompt(task_prompt or user_prompt) if can_retry else None,
+                new_config=new_thread_config,
+            )
+            self.thread_config = result.config
+            turn_messages, response = result.messages, result.response
 
             activity = model_tool_activity(turn_messages)
             async def approve_host_check(request: dict) -> bool:
@@ -1840,20 +1805,6 @@ class AgentTUI(App):
                     )
                 )
             else:
-                previous_assistant = next(
-                    (
-                        item["content"] for item in reversed(self.conversation_store.load_all())
-                        if item["role"] == "assistant"
-                    ),
-                    None,
-                )
-                quality_error = response_quality_error(
-                    response,
-                    previous_assistant=previous_assistant,
-                    current_request=user_prompt or "",
-                )
-                if quality_error is not None:
-                    raise RepetitiveResponseError(quality_error)
                 if self._active_plan is not None:
                     response = verified_plan_response(
                         self._active_plan, response, activity
@@ -1874,6 +1825,9 @@ class AgentTUI(App):
                     self.conversation_store.clear_pending()
 
         except Exception as error:
+            if runner is not None:
+                turn_messages = runner.messages
+                self.thread_config = runner.config
             if self._active_plan is not None:
                 try:
                     state = await self.agent.aget_state(self.thread_config)
@@ -1897,12 +1851,13 @@ class AgentTUI(App):
             self._write_warning(describe_error(error, self.model_name))
         finally:
             reset_status(status_token)
+            reset_conversation(conversation_token)
             reset_active_workspace(workspace_token)
             # Keep only the current turn's tool transcript in the graph.
             self.thread_config = new_thread_config()
             self._set_busy(False)
 
-    async def _ask_approval(self, request: dict) -> bool:
+    async def _ask_approval(self, request: dict, *, direct: bool = False) -> bool:
         record = self.thread_manager.resolve(self.thread_id)
         mode = record.trust_mode
         if mode == "yes-trust":
@@ -1912,7 +1867,7 @@ class AgentTUI(App):
             return True
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         detail = self.credentials.redact(format_action_request(request))
-        if parse_model_selection(self.model_name)[0] != "ollama":
+        if not direct and parse_model_selection(self.model_name)[0] != "ollama":
             detail = f"{CLOUD_TOOL_WARNING}\n\n{detail}"
         self.push_screen(
             ApprovalScreen(
@@ -2023,7 +1978,39 @@ class AgentTUI(App):
         if self.conversation_store.load_pending():
             self._write_chat_block(Text("This thread has an interrupted request; send it again to resume.", style=WALLACE_THEME["warning"]))
 
+    @work(exclusive=True, group="direct-command")
+    async def run_direct_command(self, command: str) -> None:
+        """Run the user's shell command through Wallace's scoped tool, not the model."""
+        self._set_busy(True)
+        workspace_token = set_active_workspace(self.workspace_root)
+        try:
+            self._write_chat_block(Text(f"$ {self.credentials.redact(command)}", style=WALLACE_THEME["primary"]))
+            self._set_thinking_status(rotate=False, message="Running command")
+            result = await execute_command_async(command, user_directed=True)
+            self._write_chat_block(Text(
+                self.credentials.redact(result),
+                style=WALLACE_THEME["success"] if result.startswith("Exit code: 0") else WALLACE_THEME["warning"],
+            ))
+            if self.workspace_panel is not None:
+                self.workspace_panel.refresh_view("Command finished")
+        except Exception as error:
+            self._write_warning(f"Command failed: {self.credentials.redact(str(error))}")
+        finally:
+            reset_active_workspace(workspace_token)
+            self._set_busy(False)
+
     def _handle_thread_command(self, command: str) -> None:
+        try:
+            direct_command = direct_command_text(command)
+        except ValueError as error:
+            self._write_warning(str(error))
+            return
+        if direct_command is not None:
+            if self._busy:
+                self._write_warning("Finish or cancel the current request before running a command.")
+            else:
+                self.run_direct_command(direct_command)
+            return
         try:
             parts = shlex.split(command)
         except ValueError as error:
@@ -2156,7 +2143,7 @@ class AgentTUI(App):
             elif action == "/clear":
                 self.action_clear_log()
             else:
-                self._write_warning("Commands: /status, /threads, /new [--trust MODE] [title], /trust [MODE [SECONDS]], /edit [path], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /keys")
+                self._write_warning("Commands: /run <command>, /status, /threads, /new [--trust MODE] [title], /trust [MODE [SECONDS]], /edit [path], /switch <id or title>, /rename <title>, /remove <id or title>, /clear, /theme, /model, /mcp, /keys")
         except (OSError, ValueError) as error:
             self._write_warning(f"Thread command failed: {error}")
 
